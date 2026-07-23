@@ -790,7 +790,7 @@ export class InventoryUi {
     this.positionTip(ev);
   }
 
-  /** Place tip below-right of cursor; grow downward (WoW-style). Flip only if clipped. */
+  /** Place tip below-right of cursor; grow downward. Flip only if clipped. */
   private positionTip(ev: MouseEvent): void {
     const pad = 14;
     const tw = this.tooltipEl.offsetWidth || 200;

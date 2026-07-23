@@ -1448,7 +1448,7 @@ button.danger {
   border-color: #58a6ff !important;
 }
 
-/* Item tooltip — vertical stack (name → type → stats → reqs), WoW-style */
+/* Item tooltip — vertical stack (name → type → stats → reqs) */
 #inv-tooltip {
   position: fixed;
   z-index: 60;

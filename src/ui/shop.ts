@@ -281,7 +281,7 @@ export class ShopUi {
     this.positionTip(ev);
   }
 
-  /** Prefer below-right of cursor so the stack reads top→bottom like WoW. */
+  /** Prefer below-right of cursor so the stack reads top→bottom. */
   private positionTip(ev: MouseEvent): void {
     const tip = this.tipEl();
     if (!tip || tip.classList.contains('hidden')) return;

@@ -380,7 +380,7 @@ export function unequipBag(inv: Inventory, bagSlot: number): boolean {
 }
 
 /**
- * Plain multi-line tooltip text (newline-stacked, WoW-style).
+ * Plain multi-line tooltip text (one field per line).
  * Prefer itemTooltipHtml for colored UI tooltips.
  */
 export function itemTooltip(inst: ItemInstance, skills?: Skills, extraLine?: string): string {
@@ -395,7 +395,7 @@ export interface TooltipLine {
   color?: string;
 }
 
-/** Structured lines for a vertical (downward-stacking) item tooltip. */
+/** Structured lines for a vertical item tooltip. */
 export function itemTooltipLines(
   inst: ItemInstance,
   skills?: Skills,
@@ -456,7 +456,7 @@ export function itemTooltipLines(
   return lines;
 }
 
-/** HTML for inv/shop tooltip — lines stack top → bottom like classic RPG tooltips. */
+/** HTML for inv/shop tooltip — lines stack top → bottom. */
 export function itemTooltipHtml(
   inst: ItemInstance,
   skills?: Skills,

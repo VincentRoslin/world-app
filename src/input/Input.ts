@@ -1,7 +1,7 @@
 import type { Renderer } from '../render/Renderer';
 import type { World } from '../world/World';
 import type { Entity } from '../core/types';
-import { commandAt, queueFish, queueHeroAttack, selectAt } from '../systems/Commands';
+import { commandAt, queueFish, queueHeroAttack, queueShopInteract, selectAt } from '../systems/Commands';
 import { CONFIG } from '../config';
 import { placeBlacksmith } from '../systems/Production';
 
@@ -15,8 +15,13 @@ export class Input {
   private renderer: Renderer;
   private onToggleCharacter: () => void;
   private onToggleBags: () => void;
-  private onOpenShop: (npcName: string) => void;
+
   private uiKeyHeld = new Set<string>();
+  /**
+   * Soft lock: when true, camera centers on the hero each frame.
+   * WASD / arrows / middle-drag pan unlocks; F re-locks on the hero.
+   */
+  private cameraFollow = true;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -25,7 +30,6 @@ export class Input {
     opts?: {
       onToggleCharacter?: () => void;
       onToggleBags?: () => void;
-      onOpenShop?: (npcName: string) => void;
     },
   ) {
     this.canvas = canvas;
@@ -33,12 +37,16 @@ export class Input {
     this.renderer = renderer;
     this.onToggleCharacter = opts?.onToggleCharacter ?? (() => undefined);
     this.onToggleBags = opts?.onToggleBags ?? (() => undefined);
-    this.onOpenShop = opts?.onOpenShop ?? (() => undefined);
 
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     canvas.addEventListener('mousedown', (e) => this.onMouseDown(e));
     canvas.addEventListener('mouseup', (e) => this.onMouseUp(e));
     canvas.addEventListener('mousemove', (e) => this.onMouseMove(e));
+    canvas.addEventListener('mouseleave', () => {
+      this.world.hoverTile = null;
+      this.world.hoverEntityId = null;
+      this.canvas.style.cursor = 'default';
+    });
     canvas.addEventListener('wheel', (e) => this.onWheel(e), { passive: false });
 
     window.addEventListener('keydown', (e) => {
@@ -54,12 +62,18 @@ export class Input {
         this.uiKeyHeld.add('b');
         this.onToggleBags();
       }
+      // F = re-lock soft camera follow on the hero
+      if (k === 'f' && !this.uiKeyHeld.has('f')) {
+        this.uiKeyHeld.add('f');
+        this.lockCameraOnHero();
+      }
       if (k === 'escape') {
         this.world.buildingPlacement = null;
         this.world.inventoryOpen = false;
         document.getElementById('character-panel')?.classList.add('hidden');
         document.getElementById('shop-panel')?.classList.add('hidden');
         document.getElementById('help-modal')?.classList.add('hidden');
+        // Full map overlay close is handled in MapChrome
       }
     });
     window.addEventListener('keyup', (e) => {
@@ -69,14 +83,69 @@ export class Input {
     });
   }
 
+  /** Soft lock on (default after restart / F). */
+  isCameraFollow(): boolean {
+    return this.cameraFollow;
+  }
+
+  /** Enable follow and snap to hero (or base if no hero). */
+  lockCameraOnHero(): void {
+    this.cameraFollow = true;
+    this.snapFollowTarget();
+    this.world.message = 'Camera following hero (WASD unlocks).';
+  }
+
+  /** Reset soft lock without a toast (restart / load). */
+  resetCameraFollow(): void {
+    this.cameraFollow = true;
+  }
+
+  private unlockCamera(): void {
+    this.cameraFollow = false;
+  }
+
+  private snapFollowTarget(): void {
+    const hero = this.world.hero();
+    if (hero && hero.alive) {
+      this.renderer.centerOn(hero.x, hero.y);
+      return;
+    }
+    const base = this.world.base();
+    if (base) this.renderer.centerOn(base.x, base.y);
+  }
+
+  /**
+   * Apply soft-lock: center on hero when follow is on.
+   * Call after movement so the camera tracks the current position.
+   */
+  applyCameraFollow(): void {
+    if (!this.cameraFollow) return;
+    const hero = this.world.hero();
+    if (hero && hero.alive) {
+      this.renderer.centerOn(hero.x, hero.y);
+      return;
+    }
+    // Dead / missing hero: hold on base rather than freezing mid-map
+    const base = this.world.base();
+    if (base) this.renderer.centerOn(base.x, base.y);
+  }
+
   update(dt: number): void {
     // The inventory is an overlay, not a modal game state. Keep camera controls
     // available while comparing equipment or managing bags.
     const panSpeed = 420 / this.renderer.zoom;
-    if (this.keys.has('w') || this.keys.has('arrowup')) this.renderer.cameraY += panSpeed * dt;
-    if (this.keys.has('s') || this.keys.has('arrowdown')) this.renderer.cameraY -= panSpeed * dt;
-    if (this.keys.has('a') || this.keys.has('arrowleft')) this.renderer.cameraX += panSpeed * dt;
-    if (this.keys.has('d') || this.keys.has('arrowright')) this.renderer.cameraX -= panSpeed * dt;
+    const panUp = this.keys.has('w') || this.keys.has('arrowup');
+    const panDown = this.keys.has('s') || this.keys.has('arrowdown');
+    const panLeft = this.keys.has('a') || this.keys.has('arrowleft');
+    const panRight = this.keys.has('d') || this.keys.has('arrowright');
+    if (panUp || panDown || panLeft || panRight) {
+      // Soft unlock: free look while panning
+      this.unlockCamera();
+      if (panUp) this.renderer.cameraY += panSpeed * dt;
+      if (panDown) this.renderer.cameraY -= panSpeed * dt;
+      if (panLeft) this.renderer.cameraX += panSpeed * dt;
+      if (panRight) this.renderer.cameraX -= panSpeed * dt;
+    }
   }
 
   private eventToCanvas(e: MouseEvent): { sx: number; sy: number } {
@@ -176,6 +245,7 @@ export class Input {
   private onMouseDown(e: MouseEvent): void {
     if (e.button === 1 || (e.button === 0 && e.altKey)) {
       this.panning = true;
+      this.unlockCamera();
       this.lastPanX = e.clientX;
       this.lastPanY = e.clientY;
       return;
@@ -216,14 +286,14 @@ export class Input {
         selectAt(this.world, gx, gy, wpos.x, wpos.y);
       }
     } else if (e.button === 2) {
-      // RMB shop NPC → open free test shop
+      // RMB shop NPC → walk into range then open (like attack/fish)
       const npc = this.pickEntityAtScreen(sx, sy, ['npc']);
       if (npc && npc.kind === 'npc' && npc.role === 'shop') {
         this.world.selectedId = npc.id;
-        this.onOpenShop(npc.name);
+        queueShopInteract(this.world, npc.id);
         return;
       }
-      // RMB on mob → queue attack for next game tick (OSRS-style)
+      // RMB on mob → queue attack for next game tick
       const enemy = this.pickEntityAtScreen(sx, sy, ['enemy']);
       if (enemy && enemy.kind === 'enemy') {
         queueHeroAttack(this.world, enemy.id);
@@ -254,7 +324,34 @@ export class Input {
     const wpos = this.eventToWorld(e);
     this.world.hoverTile = { gx: Math.floor(wpos.x), gy: Math.floor(wpos.y) };
 
+    // Entity under cursor for subtle interactable highlight (nodes, vendor, units, …)
+    // Skip while placing a building — tile ghost already communicates intent.
+    if (this.world.buildingPlacement) {
+      this.world.hoverEntityId = null;
+      this.canvas.style.cursor = 'crosshair';
+    } else {
+      const { sx, sy } = this.eventToCanvas(e);
+      const picked = this.pickEntityAtScreen(sx, sy, [
+        'hero',
+        'worker',
+        'base',
+        'blacksmith',
+        'npc',
+        'enemy',
+        'resourceNode',
+        'loot',
+      ]);
+      // Only highlight loot piles that still have items
+      if (picked && picked.kind === 'loot' && picked.items.length === 0) {
+        this.world.hoverEntityId = null;
+      } else {
+        this.world.hoverEntityId = picked?.id ?? null;
+      }
+      this.canvas.style.cursor = this.world.hoverEntityId != null ? 'pointer' : 'default';
+    }
+
     if (this.panning) {
+      this.unlockCamera();
       const dx = e.clientX - this.lastPanX;
       const dy = e.clientY - this.lastPanY;
       this.renderer.cameraX += dx;

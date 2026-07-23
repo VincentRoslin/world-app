@@ -20,6 +20,7 @@ function effectiveSpeed(unit: Mover): number {
   return unit.speed;
 }
 
+/** Straight-line step toward a world point (simple routing — no multi-sample steer). */
 function stepToward(world: World, unit: Mover, tx: number, ty: number, step: number): void {
   const d = dist(unit.x, unit.y, tx, ty);
   let nx = unit.x;
@@ -75,6 +76,10 @@ function setMoveOrder(world: World, unit: Mover, tx: number, ty: number): void {
     unit.order = { type: 'none' };
     return;
   }
+  if (from.gx === goalX && from.gy === goalY) {
+    unit.order = { type: 'move', tx: goalX, ty: goalY, path: [] };
+    return;
+  }
   const path = findPath(walk(world), from.gx, from.gy, goalX, goalY);
   unit.order = { type: 'move', tx: goalX, ty: goalY, path };
 }
@@ -92,15 +97,16 @@ export function issueGather(unit: Mover, nodeId: number): void {
 }
 
 /**
- * Continuous movement every frame (smooth travel).
- * Speed matches OSRS run for the hero (~2 tiles / 0.6s tick).
- * Combat/intents still resolve on the game tick.
+ * Continuous movement every frame.
+ *
+ * Routing is intentionally simple again (grid path → tile centers → step):
+ * crowded farm jams are eased by spacing resource nodes (see MapGen /
+ * nodeMinSeparation), not by aggressive local dodge that made workers spin.
  */
 export function updateMovement(world: World, dt: number): void {
   for (const e of world.entities.values()) {
     if (!e.alive) continue;
     if (e.kind !== 'hero' && e.kind !== 'worker' && e.kind !== 'enemy') continue;
-    // Keep prev for light visual smoothing when not mid-lerp from ticks
     if (e.prevX === undefined) e.prevX = e.x;
     if (e.prevY === undefined) e.prevY = e.y;
     stepUnit(world, e, dt);
@@ -113,6 +119,35 @@ export function updateMovement(world: World, dt: number): void {
   applySeparation(world, dt);
 }
 
+function heroMoveDir(hero: Extract<Entity, { kind: 'hero' }>): { x: number; y: number } {
+  const o = hero.order;
+  let tx = hero.x;
+  let ty = hero.y;
+  if (o.type === 'move') {
+    if (o.path.length > 0) {
+      tx = o.path[0]!.x + 0.5;
+      ty = o.path[0]!.y + 0.5;
+    } else {
+      tx = o.tx + 0.5;
+      ty = o.ty + 0.5;
+    }
+  } else if (o.type === 'attack' && o.path && o.path.length > 0) {
+    tx = o.path[0]!.x + 0.5;
+    ty = o.path[0]!.y + 0.5;
+  } else {
+    return { x: 0, y: 0 };
+  }
+  const dx = tx - hero.x;
+  const dy = ty - hero.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-5) return { x: 0, y: 0 };
+  return { x: dx / len, y: dy / len };
+}
+
+/**
+ * Soft separation only — light touch so units don't stack, without fighting
+ * the path follower (which was the spin source).
+ */
 function applySeparation(world: World, dt: number): void {
   const units: Mover[] = [];
   for (const e of world.entities.values()) {
@@ -124,14 +159,24 @@ function applySeparation(world: World, dt: number): void {
   const r = CONFIG.unitRadius;
   const r2 = (r * 2) ** 2;
   const strength = CONFIG.separationStrength * dt;
+  const maxStep = CONFIG.separationMaxSpeed * dt;
+  const lateralBias = CONFIG.separationLateralBias;
 
   for (let i = 0; i < units.length; i++) {
     const a = units[i]!;
-    // A worker at a claimed gathering slot is an obstacle, not something that
-    // can be displaced: moving it resets its work cycle.
+    if (a.kind === 'hero') continue;
+    // Gathering workers stay planted so their gather timer isn't interrupted
     if (a.kind === 'worker' && a.phase === 'gathering') continue;
+    if (a.kind === 'worker' && (a.phase === 'waiting' || a.phase === 'building')) continue;
+
     let fx = 0;
     let fy = 0;
+    let fromHeroX = 0;
+    let fromHeroY = 0;
+    let heroVx = 0;
+    let heroVy = 0;
+    let pushedByHero = false;
+
     for (let j = 0; j < units.length; j++) {
       if (i === j) continue;
       const b = units[j]!;
@@ -141,12 +186,49 @@ function applySeparation(world: World, dt: number): void {
       if (d2 < 1e-8 || d2 > r2) continue;
       const d = Math.sqrt(d2);
       const push = ((r * 2 - d) / (r * 2)) * strength;
-      fx += (dx / d) * push;
-      fy += (dy / d) * push;
+      const px = (dx / d) * push;
+      const py = (dy / d) * push;
+      fx += px;
+      fy += py;
+      if (b.kind === 'hero') {
+        pushedByHero = true;
+        fromHeroX += px;
+        fromHeroY += py;
+        const dir = heroMoveDir(b);
+        heroVx = dir.x;
+        heroVy = dir.y;
+      }
     }
-    if (fx !== 0 || fy !== 0) {
-      applyPosition(world, a, a.x + fx, a.y + fy);
+
+    if (fx === 0 && fy === 0) continue;
+
+    // Hero walk-through: workers glide sideways instead of being shoved along the path
+    if (pushedByHero && a.kind === 'worker') {
+      const hspd = Math.hypot(heroVx, heroVy);
+      if (hspd > 1e-5) {
+        const fxN = heroVx / hspd;
+        const fyN = heroVy / hspd;
+        let lx = -fyN;
+        let ly = fxN;
+        if (fromHeroX * lx + fromHeroY * ly < 0) {
+          lx = -lx;
+          ly = -ly;
+        }
+        const along = fromHeroX * fxN + fromHeroY * fyN;
+        const back = Math.max(0, along) * (1 - lateralBias);
+        const side = Math.hypot(fromHeroX, fromHeroY) * lateralBias + Math.abs(along) * lateralBias;
+        fx = fx - fromHeroX + fxN * (-back * 0.35) + lx * side;
+        fy = fy - fromHeroY + fyN * (-back * 0.35) + ly * side;
+      }
     }
+
+    const mag = Math.hypot(fx, fy);
+    if (mag > maxStep && mag > 1e-8) {
+      fx = (fx / mag) * maxStep;
+      fy = (fy / mag) * maxStep;
+    }
+
+    applyPosition(world, a, a.x + fx, a.y + fy);
   }
 }
 
@@ -207,7 +289,6 @@ function stepUnit(world: World, unit: Mover, dt: number): void {
       goalX = adj.x;
       goalY = adj.y;
     }
-    // Repath only when start tile or goal tile changed (or path empty/blocked)
     const needRepath =
       !order.path ||
       order.path.length === 0 ||
@@ -225,7 +306,6 @@ function stepUnit(world: World, unit: Mover, dt: number): void {
     }
     if (order.path && order.path.length > 0) {
       followPath(world, unit, order.path, dt, speed);
-      // Update from key after step so we repath when tile changes
       const nf = floorTile(unit.x, unit.y);
       order.pathFromX = nf.gx;
       order.pathFromY = nf.gy;
@@ -286,9 +366,27 @@ function stepUnit(world: World, unit: Mover, dt: number): void {
     const from = floorTile(unit.x, unit.y);
     const goalX = Math.floor(tx);
     const goalY = Math.floor(ty);
-    const path = findPath(w, from.gx, from.gy, goalX, goalY);
-    if (path.length > 0) {
-      followPath(world, unit, path, dt, speed);
+    // Cache path while tile-to-tile goal is stable (avoids repath thrash)
+    const needRepath =
+      !order.path ||
+      order.path.length === 0 ||
+      order.pathGoalX !== goalX ||
+      order.pathGoalY !== goalY ||
+      order.pathFromX !== from.gx ||
+      order.pathFromY !== from.gy ||
+      (order.path[0] != null && !w(order.path[0].x, order.path[0].y));
+    if (needRepath) {
+      order.path = findPath(w, from.gx, from.gy, goalX, goalY);
+      order.pathGoalX = goalX;
+      order.pathGoalY = goalY;
+      order.pathFromX = from.gx;
+      order.pathFromY = from.gy;
+    }
+    if (order.path && order.path.length > 0) {
+      followPath(world, unit, order.path, dt, speed);
+      const nf = floorTile(unit.x, unit.y);
+      order.pathFromX = nf.gx;
+      order.pathFromY = nf.gy;
     } else {
       stepToward(world, unit, tx, ty, step);
     }
@@ -336,6 +434,7 @@ function stepUnit(world: World, unit: Mover, dt: number): void {
   }
 }
 
+/** Follow grid path via tile centers (classic routing). */
 function followPath(
   world: World,
   unit: Mover,

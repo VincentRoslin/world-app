@@ -27,24 +27,52 @@
               <span id="food">0</span>
               <span class="income" id="food-income">+0</span>
             </span>
-            <span class="tick-timer" id="cycle-hint" title="Workers gather then deposit"
-              >10s → base</span
-            >
           </div>
           <div class="explore-info">
             <span id="explore-status">Explored —</span>
           </div>
           <div class="controls">
             <button type="button" id="btn-help" title="Controls help">Help</button>
-            <button type="button" id="btn-pause" title="Pause">❚❚</button>
-            <button type="button" id="btn-speed" title="Speed">1×</button>
+            <button type="button" id="btn-pause" title="Pause / Play">Pause</button>
             <button type="button" id="btn-save" title="Save">Save</button>
             <button type="button" id="btn-load" title="Load">Load</button>
           </div>
         </div>
+        <!-- Minimap: normal | minimized tray | expand opens full map overlay -->
         <div id="minimap-wrap">
-          <div class="minimap-label">Map</div>
+          <div class="minimap-chrome">
+            <span class="minimap-label">Map</span>
+            <div class="minimap-actions">
+              <button type="button" id="btn-minimap-min" title="Minimize map" aria-label="Minimize map">
+                −
+              </button>
+              <button type="button" id="btn-minimap-expand" title="Full map" aria-label="Open full map">
+                ⛶
+              </button>
+            </div>
+          </div>
           <canvas id="minimap" width="180" height="180"></canvas>
+        </div>
+        <div id="minimap-tray" class="hidden" title="Restore map">
+          <button type="button" id="btn-minimap-restore" class="minimap-tray-btn">
+            <span class="minimap-tray-icon" aria-hidden="true">🗺️</span>
+            <span>Map</span>
+          </button>
+          <button type="button" id="btn-minimap-tray-expand" class="minimap-tray-icon-btn" title="Full map" aria-label="Open full map">
+            ⛶
+          </button>
+        </div>
+        <div id="map-overlay" class="hidden" aria-hidden="true">
+          <div class="map-overlay-window">
+            <div class="map-overlay-header">
+              <h2>World Map</h2>
+              <button type="button" id="btn-map-overlay-close" title="Close">✕</button>
+            </div>
+            <canvas id="map-full" width="560" height="560"></canvas>
+            <p class="map-overlay-hint">
+              Drag to pan · scroll to zoom · double-click to fit explored · white ring = you · blue = base
+            </p>
+          </div>
         </div>
         <div id="panel">
           <div id="selection-title">Nothing selected</div>
@@ -77,30 +105,42 @@
         <!-- Floating bag panels container -->
         <div id="bag-panels"></div>
 
-        <!-- Character window: Inventory / Skills tabs -->
+        <!-- Character window (ref: docs/refs/character_tab.png) -->
         <div id="character-panel" class="hidden">
           <div class="char-window">
             <div class="char-header">
-              <h2>Character</h2>
-              <div class="char-tabs">
-                <button type="button" class="char-tab active" data-tab="inventory">Inventory</button>
-                <button type="button" class="char-tab" data-tab="skills">Skills</button>
+              <canvas id="char-portrait" class="char-portrait" width="44" height="52" title="Hero"></canvas>
+              <div class="char-title-block">
+                <h2 id="char-name">Hero</h2>
+                <div id="char-subtitle" class="char-subtitle">Level 1 · Settler</div>
               </div>
-              <button type="button" id="btn-char-close">✕</button>
+              <button type="button" id="btn-char-close" title="Close">✕</button>
             </div>
-            <div id="char-tab-inventory" class="char-tab-body">
+
+            <div id="char-tab-character" class="char-tab-body">
               <div id="inv-equip" class="paper-doll">
                 <div class="pd-left" id="pd-left"></div>
                 <div class="pd-center" id="pd-center">
-                  <div class="pd-center-stats" id="pd-center-stats"></div>
+                  <canvas id="char-preview" width="148" height="168" aria-label="Hero preview"></canvas>
                 </div>
                 <div class="pd-right" id="pd-right"></div>
                 <div class="pd-weapons" id="pd-weapons"></div>
               </div>
-              <p class="inv-hint">Open bags (bottom-right) · Click items to equip · Click gear to unequip</p>
+              <p class="inv-hint">Click bag items to equip · Click gear to unequip</p>
             </div>
+
+            <div id="char-tab-stats" class="char-tab-body hidden">
+              <div id="pd-center-stats" class="char-stats-panel"></div>
+            </div>
+
             <div id="char-tab-skills" class="char-tab-body hidden">
               <div id="inv-skills-panel" class="inv-stats-panel full"></div>
+            </div>
+
+            <div class="char-footer-tabs" role="tablist">
+              <button type="button" class="char-tab active" data-tab="character">Character</button>
+              <button type="button" class="char-tab" data-tab="stats">Stats</button>
+              <button type="button" class="char-tab" data-tab="skills">Skills</button>
             </div>
           </div>
         </div>
@@ -113,14 +153,16 @@
 
       <div id="inv-tooltip" class="hidden"></div>
 
-      <!-- Free test shop (dev) -->
+      <!-- Free test shop (dev) — categories for gear, skills, resources -->
       <div id="shop-panel" class="hidden">
         <div class="shop-window">
           <div class="shop-header">
             <h2 id="shop-title">Shop</h2>
             <button type="button" id="btn-shop-close">✕</button>
           </div>
-          <p class="shop-hint">Dev vendor — everything is free. Click to take.</p>
+          <p class="shop-hint">Dev vendor — free. Stand close · RMB to open · walk away to close.</p>
+          <div id="shop-tabs" class="shop-tabs" role="tablist"></div>
+          <div id="shop-subtabs" class="shop-subtabs hidden" role="tablist"></div>
           <div id="shop-body" class="shop-body"></div>
         </div>
       </div>
@@ -130,18 +172,23 @@
           <h2>Controls</h2>
           <p>
             <strong>LMB</strong> select · <strong>RMB</strong> ground to move · <strong>RMB</strong> mob to attack<br />
-            <strong>WASD</strong> pan · <strong>Scroll</strong> zoom · <strong>B</strong> open all bags ·
-            <strong>C</strong> character pane<br />
-            <strong>Game tick</strong> (OSRS-style): world advances every <strong>0.6s</strong>. Clicked
+            <strong>WASD</strong> pan camera (unlocks follow) · <strong>F</strong> lock camera on hero ·
+            <strong>Scroll</strong> zoom · <strong>B</strong> bags · <strong>C</strong> character<br />
+            Map: <strong>−</strong> minimize to tray · <strong>⛶</strong> full map · tray restores the mini map<br />
+            <strong>Game tick</strong>: world advances every <strong>0.6s</strong>. Clicked
             actions apply on the <strong>next tick</strong>. Walk = 1 tile/tick.<br />
             Workers: Mine / Log / Farm. Home square is safe — explore adjacent areas for cows, goblins,
             humans.<br />
             Combat: RMB a mob to attack · RMB ground to flee · one target at a time.<br />
-            Shop: RMB the Test Vendor (north of base) for free gear and resources.
+            Shop: RMB Ebbe Greyho (north of base) — hero walks over and opens free shop.
           </p>
           <button type="button" id="btn-help-close">Close</button>
         </div>
       </div>
+      <div id="pause-overlay" class="hidden" aria-hidden="true">
+        <div class="pause-label">Paused</div>
+      </div>
+
       <div id="overlay" class="hidden">
         <div class="modal">
           <h2 id="overlay-title">Game Over</h2>

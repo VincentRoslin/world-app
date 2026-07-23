@@ -3,6 +3,7 @@ import type { World } from '../world/World';
 import { clearFishing, queueFish } from './Fishing';
 import { issueMove } from './Movement';
 import { assignWorkerJob, queueTrainWorker } from './Production';
+import { clearShopInteract, queueShopInteract } from './ShopInteract';
 
 export function selectAt(world: World, gx: number, gy: number, wx?: number, wy?: number): void {
   const kinds: Array<
@@ -27,7 +28,7 @@ export function selectAt(world: World, gx: number, gy: number, wx?: number, wy?:
 }
 
 /**
- * Queue a ground command. Hero moves/flees on the **next game tick** (OSRS-style).
+ * Queue a ground command. Hero moves/flees on the **next game tick**.
  * Workers still get immediate pathing when selected.
  */
 export function commandAt(world: World, wx: number, wy: number): void {
@@ -58,6 +59,7 @@ export function commandAt(world: World, wx: number, wy: number): void {
   world.selectedId = hero.id;
   world.pendingAttackId = null;
   world.pendingFishId = null;
+  clearShopInteract(world);
   clearFishing(hero);
   world.pendingMove = { x: wx, y: wy };
   world.message = hero.combatEngaged ? 'Moving…' : 'Walking…';
@@ -71,12 +73,13 @@ export function queueHeroAttack(world: World, enemyId: number): void {
   world.selectedId = hero.id;
   world.pendingMove = null;
   world.pendingFishId = null;
+  clearShopInteract(world);
   clearFishing(hero);
   world.pendingAttackId = enemyId;
   world.message = 'Attacking…';
 }
 
-export { queueFish };
+export { queueFish, queueShopInteract };
 
 export function trainWorkerCommand(world: World): boolean {
   return queueTrainWorker(world);

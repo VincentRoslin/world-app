@@ -2,6 +2,7 @@ export type EquipSlot =
   | 'head'
   | 'neck'
   | 'shoulders'
+  | 'cloak'
   | 'chest'
   | 'wrist'
   | 'hands'
@@ -18,13 +19,15 @@ export type EquipKey =
   | 'head'
   | 'neck'
   | 'shoulders'
+  | 'cloak'
   | 'chest'
   | 'wrist'
   | 'hands'
   | 'belt'
   | 'legs'
   | 'feet'
-  | 'ring'
+  | 'ring1'
+  | 'ring2'
   | 'mainHand'
   | 'offHand';
 
@@ -46,7 +49,7 @@ export interface ItemDef {
   /** Equipment category; bag items use slot 'bag'. Junk uses 'none'. */
   slot: EquipSlot | 'none';
   weaponType?: WeaponType;
-  /** OSRS-style combat bonuses (squished). */
+  /** Combat bonuses from this item when equipped. */
   attackBonus?: number;
   strengthBonus?: number;
   defenseBonus?: number;
@@ -68,7 +71,22 @@ export interface ItemDef {
    */
   maxStack?: number;
   /** Visual glyph for basic sprite icons. */
-  icon?: 'sword' | 'axe' | 'dagger' | 'shield' | 'helm' | 'chest' | 'boots' | 'ring' | 'bag' | 'bone' | 'cloth' | 'amulet' | 'gloves' | 'generic';
+  icon?:
+    | 'sword'
+    | 'axe'
+    | 'dagger'
+    | 'shield'
+    | 'helm'
+    | 'chest'
+    | 'boots'
+    | 'ring'
+    | 'cloak'
+    | 'bag'
+    | 'bone'
+    | 'cloth'
+    | 'amulet'
+    | 'gloves'
+    | 'generic';
 }
 
 export interface ItemInstance {
@@ -102,13 +120,15 @@ export const EQUIP_KEYS: EquipKey[] = [
   'head',
   'neck',
   'shoulders',
+  'cloak',
   'chest',
   'wrist',
   'hands',
   'belt',
   'legs',
   'feet',
-  'ring',
+  'ring1',
+  'ring2',
   'mainHand',
   'offHand',
 ];
@@ -117,18 +137,20 @@ export const EQUIP_LABELS: Record<EquipKey, string> = {
   head: 'Head',
   neck: 'Neck',
   shoulders: 'Shoulders',
+  cloak: 'Cloak',
   chest: 'Chest',
   wrist: 'Wrist',
   hands: 'Hands',
   belt: 'Belt',
   legs: 'Pants',
   feet: 'Boots',
-  ring: 'Ring',
+  ring1: 'Ring 1',
+  ring2: 'Ring 2',
   mainHand: 'Main Hand',
   offHand: 'Off Hand',
 };
 
-/** WoW-style paper-doll columns */
-export const PAPER_DOLL_LEFT: EquipKey[] = ['head', 'neck', 'shoulders', 'chest', 'wrist'];
-export const PAPER_DOLL_RIGHT: EquipKey[] = ['hands', 'belt', 'legs', 'feet', 'ring'];
+/** Equipment panel columns (6 + 6 + weapons) */
+export const PAPER_DOLL_LEFT: EquipKey[] = ['head', 'neck', 'shoulders', 'cloak', 'chest', 'wrist'];
+export const PAPER_DOLL_RIGHT: EquipKey[] = ['hands', 'belt', 'legs', 'feet', 'ring1', 'ring2'];
 export const PAPER_DOLL_WEAPONS: EquipKey[] = ['mainHand', 'offHand'];

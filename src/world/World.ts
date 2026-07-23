@@ -1,4 +1,5 @@
 import { CONFIG, ENEMY_SPECIES, type EnemySpeciesId } from '../config';
+import { normalizeCoins } from '../core/currency';
 import type {
   BaseBuilding,
   BlacksmithBuilding,
@@ -19,8 +20,8 @@ import type {
   WorkerJob,
 } from '../core/types';
 import type { Inventory, ItemInstance } from '../items/types';
-import { createEmptyInventory, applyHeroStats } from '../systems/Inventory';
-import { createDefaultSkills } from '../systems/Skills';
+import { createEmptyInventory, applyHeroStats, normalizeEquipped } from '../systems/Inventory';
+import { createDefaultSkills, normalizeSkills } from '../systems/Skills';
 import { chunkOrigin, generateHomeChunk, generateWildChunk } from './MapGen';
 
 function tileKey(gx: number, gy: number): string {
@@ -31,6 +32,18 @@ function chunkKey(cx: number, cy: number): string {
   return `${cx},${cy}`;
 }
 
+/**
+ * Authoritative game state: tiles, entities, stockpile, inventory, tick clock.
+ *
+ * Systems (Combat, Production, Fishing, Movement, …) take a World and mutate it.
+ * World itself owns factories (createWorker, createResourceNode), spatial queries
+ * (findWorkNode, isWalkable), and save/load (toJSON / fromJSON).
+ *
+ * Hybrid sim reminder:
+ * - tickAcc / tickCount: discrete server clock (GameTick.ts)
+ * - entities[].x/y: continuous positions updated every frame by Movement
+ * - pendingMove / pendingAttackId / pendingFishId: player intents for next tick
+ */
 export class World {
   worldSeed = 42;
   tiles = new Map<string, Tile>();
@@ -49,17 +62,22 @@ export class World {
   nextItemUid = 1;
   inventory: Inventory = createEmptyInventory();
   inventoryOpen = false;
-  /** Accumulates real time toward OSRS-style game ticks. */
+  /** Accumulates real time toward game ticks. */
   tickAcc = 0;
-  /** Monotonic game tick counter (OSRS server cycle). */
+  /** Monotonic game tick counter. */
   tickCount = 0;
   /**
    * Player intents registered this tick; applied at the start of the next tick
-   * (OSRS: actions take effect on the following game tick).
+   * (actions take effect on the following game tick).
    */
   pendingMove: { x: number; y: number } | null = null;
   pendingAttackId: EntityId | null = null;
   pendingFishId: EntityId | null = null;
+  /**
+   * Sticky RMB vendor interact: hero walks into range then UI opens
+   * (cleared by move/attack/fish or on successful open).
+   */
+  shopInteractNpcId: EntityId | null = null;
   buildingPlacement: { workerId: EntityId; kind: 'blacksmith' } | null = null;
 
   /** Pending fishing spot respawns: timer + origin position for nearby search. */
@@ -67,6 +85,11 @@ export class World {
 
   selectedId: EntityId | null = null;
   hoverTile: { gx: number; gy: number } | null = null;
+  /**
+   * Entity under the cursor (for subtle interactable highlight).
+   * Set by Input on mousemove; null when over empty ground.
+   */
+  hoverEntityId: EntityId | null = null;
   status: GameStatus = 'playing';
   baseId: EntityId = 0;
   heroId: EntityId = 0;
@@ -90,6 +113,7 @@ export class World {
     this.nextPackId = 1;
     this.selectedId = null;
     this.hoverTile = null;
+    this.hoverEntityId = null;
     this.status = 'playing';
     this.message = '';
     this.paused = false;
@@ -105,6 +129,7 @@ export class World {
     this.pendingMove = null;
     this.pendingAttackId = null;
     this.pendingFishId = null;
+    this.shopInteractNpcId = null;
     this.pendingFishRespawns = [];
     this.buildingPlacement = null;
     this.stockpile = {
@@ -112,7 +137,7 @@ export class World {
       wood: CONFIG.startWood,
       food: CONFIG.startFood,
     };
-    this.coins = { gold: 0, silver: 10, copper: 50 };
+    this.coins = normalizeCoins({ gold: 0, silver: 10, copper: 50 });
     this.minGx = 0;
     this.maxGx = CONFIG.chunkSize - 1;
     this.minGy = 0;
@@ -249,7 +274,7 @@ export class World {
           tile.decoration = undefined;
           if (tile.terrain === 'water') tile.terrain = 'dirt';
         }
-        this.createNpc(shopX, shopY, 'shop', 'Test Vendor');
+        this.createNpc(shopX, shopY, 'shop', 'Ebbe Greyho');
       }
     }
     if (content.hero) {
@@ -552,14 +577,24 @@ export class World {
     return e;
   }
 
+  /**
+   * Spawn a harvestable node (stone pile, tree, oat field, or fishing spot).
+   * - Blocks the tile so units path around it.
+   * - Sets terrain flavor (dirt under stone, grass under farm/wood).
+   * - anchorX/Y remember the original area for relocate-on-respawn.
+   * - Stock: fish random in [fishSpotMin, fishSpotMax]; land nodes use nodeCapacity (300).
+   */
   createResourceNode(x: number, y: number, resource: ResourceKind): ResourceNode {
     const gx = Math.floor(x);
     const gy = Math.floor(y);
-    // Fishing spots sit on water (already blocked). Other nodes are solid work tiles.
+    this.setBlocked(gx, gy, true);
     if (resource !== 'fish') {
-      this.setBlocked(gx, gy, true);
-    } else {
-      this.setBlocked(gx, gy, true); // ensure blocked even if tile was shore
+      const t = this.tileAt(gx, gy);
+      if (t) {
+        t.decoration = undefined;
+        if (resource === 'stone') t.terrain = 'dirt';
+        else if (resource === 'food' || resource === 'wood') t.terrain = 'grass';
+      }
     }
     const isFish = resource === 'fish';
     const stock = isFish
@@ -580,9 +615,172 @@ export class World {
       remaining: stock,
       maxRemaining: stock,
       replenishTimer: 0,
+      // Anchor freezes the "home area" so respawns don't wander the whole chunk.
+      anchorX: x,
+      anchorY: y,
     };
     this.entities.set(e.id, e);
     return e;
+  }
+
+  /**
+   * Pick a free land tile near (nearX, nearY) for post-depletion respawn.
+   *
+   * Why this exists: empty nodes refill after nodeReplenishSeconds, but we move
+   * them slightly so the map feels dynamic. Constraints:
+   * - Stay on home chunk if the anchor was home (workers only use home nodes).
+   * - Don't stack on other nodes / buildings.
+   * - Need an orthogonal walkable neighbor (workers stand beside the solid tile).
+   * - Prefer a *different* tile than current (self score is heavily penalized).
+   *
+   * `excludeId` = the node being moved (its tile is treated as free for scoring).
+   */
+  findNearbyResourceTile(
+    nearX: number,
+    nearY: number,
+    resource: ResourceKind,
+    excludeId: EntityId | null = null,
+    radius: number = CONFIG.nodeRespawnRadius,
+  ): { x: number; y: number } | null {
+    if (resource === 'fish') return this.findNearbyWaterWithShore(nearX, nearY, radius);
+
+    const cx = Math.floor(nearX);
+    const cy = Math.floor(nearY);
+    const preferHome = this.isHomeTile(cx, cy);
+
+    let selfGx: number | null = null;
+    let selfGy: number | null = null;
+    if (excludeId != null) {
+      const self = this.get(excludeId);
+      if (self && self.kind === 'resourceNode') {
+        selfGx = Math.floor(self.x);
+        selfGy = Math.floor(self.y);
+      }
+    }
+
+    const occupied = new Set<string>();
+    /** Other land nodes — enforce min Chebyshev separation (same as MapGen). */
+    const otherNodes: { gx: number; gy: number }[] = [];
+    for (const e of this.entities.values()) {
+      if (!e.alive) continue;
+      if (excludeId != null && e.id === excludeId) continue;
+      if (e.kind === 'resourceNode') {
+        if (e.resource !== 'fish') {
+          otherNodes.push({ gx: Math.floor(e.x), gy: Math.floor(e.y) });
+        }
+        occupied.add(`${Math.floor(e.x)},${Math.floor(e.y)}`);
+      } else if (e.kind === 'base' || e.kind === 'blacksmith') {
+        const bx = Math.floor(e.x) - 1;
+        const by = Math.floor(e.y) - 1;
+        for (let dy = 0; dy < 2; dy++) {
+          for (let dx = 0; dx < 2; dx++) occupied.add(`${bx + dx},${by + dy}`);
+        }
+      }
+    }
+
+    const minSep = CONFIG.nodeMinSeparation;
+    const candidates: { x: number; y: number; score: number }[] = [];
+    for (let dy = -radius; dy <= radius; dy++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        const gx = cx + dx;
+        const gy = cy + dy;
+        const key = `${gx},${gy}`;
+        if (occupied.has(key)) continue;
+        if (preferHome !== this.isHomeTile(gx, gy)) continue;
+        const tile = this.tileAt(gx, gy);
+        if (!tile || tile.terrain === 'water') continue;
+        const isSelf = selfGx === gx && selfGy === gy;
+        // Other blocked tiles are taken; self tile is OK (we're moving off it or staying)
+        if (tile.blocked && !isSelf) continue;
+        // Keep ≥ nodeMinSeparation from every other land node
+        let spaced = true;
+        for (const n of otherNodes) {
+          if (Math.max(Math.abs(n.gx - gx), Math.abs(n.gy - gy)) < minSep) {
+            spaced = false;
+            break;
+          }
+        }
+        if (!spaced) continue;
+        const hasStand =
+          this.isWalkable(gx + 1, gy) ||
+          this.isWalkable(gx - 1, gy) ||
+          this.isWalkable(gx, gy + 1) ||
+          this.isWalkable(gx, gy - 1);
+        if (!hasStand) continue;
+        // Prefer a *new* tile: penalize staying put
+        const distSq = dx * dx + dy * dy;
+        const score = isSelf ? 1000 + distSq : distSq;
+        candidates.push({ x: gx + 0.5, y: gy + 0.5, score });
+      }
+    }
+    if (candidates.length === 0) {
+      // Fallback: allow self tile so the node still refills if the area is packed
+      if (selfGx != null && selfGy != null) {
+        return { x: selfGx + 0.5, y: selfGy + 0.5 };
+      }
+      return null;
+    }
+    candidates.sort((a, b) => a.score - b.score);
+    const bestScore = candidates[0]!.score;
+    const pool = candidates.filter((c) => c.score <= bestScore + 2).slice(0, 6);
+    return pool[Math.floor(Math.random() * pool.length)] ?? null;
+  }
+
+  /**
+   * Called when a land node's replenishTimer finishes (Production.updateNodeReplenish).
+   * 1) Find a nearby free tile around the anchor (fallback: current pos).
+   * 2) Unblock the old work tile so pathfinding can use it again.
+   * 3) Block + retheme the new tile; snap entity to its center.
+   * 4) Refill remaining/max to CONFIG.nodeCapacity.
+   * Fish is a no-op here (removed & recreated in Fishing.ts).
+   */
+  relocateAndRefillNode(node: ResourceNode): void {
+    if (node.resource === 'fish') {
+      node.remaining = node.maxRemaining;
+      node.replenishTimer = 0;
+      return;
+    }
+
+    const oldGx = Math.floor(node.x);
+    const oldGy = Math.floor(node.y);
+    // Prefer search around the original spawn area so clusters stay local.
+    const pos =
+      this.findNearbyResourceTile(node.anchorX, node.anchorY, node.resource, node.id) ??
+      this.findNearbyResourceTile(node.x, node.y, node.resource, node.id);
+
+    const stock = CONFIG.nodeCapacity;
+    node.maxRemaining = stock;
+    node.remaining = stock;
+    node.replenishTimer = 0;
+
+    if (!pos) return;
+
+    const newGx = Math.floor(pos.x);
+    const newGy = Math.floor(pos.y);
+    if (newGx === oldGx && newGy === oldGy) {
+      node.x = pos.x;
+      node.y = pos.y;
+      node.prevX = pos.x;
+      node.prevY = pos.y;
+      return;
+    }
+
+    // Free old footprint for walking / future nodes.
+    this.setBlocked(oldGx, oldGy, false);
+
+    this.setBlocked(newGx, newGy, true);
+    const newTile = this.tileAt(newGx, newGy);
+    if (newTile) {
+      newTile.decoration = undefined;
+      if (node.resource === 'stone') newTile.terrain = 'dirt';
+      else newTile.terrain = 'grass';
+    }
+
+    node.x = pos.x;
+    node.y = pos.y;
+    // Reset prev so renderer does not lerp across the map in one frame.
+    node.prevX = pos.x;
+    node.prevY = pos.y;
   }
 
   /**
@@ -688,13 +886,16 @@ export class World {
     return -1;
   }
 
+  /** True if a worker can still harvest here (has stock, not mid-respawn timer). */
   nodeIsGatherable(node: ResourceNode): boolean {
     return node.alive && node.remaining > 0 && node.replenishTimer <= 0;
   }
 
   /**
-   * Nearest gatherable node of type with a free slot.
-   * Optionally exclude a node id (e.g. just depleted).
+   * Nearest home-chunk node of `resource` that still has stock and a free stand slot.
+   * Used by Production when assigning jobs or after a deposit.
+   * Wild nodes are intentionally ignored so workers never walk off the starting island.
+   * excludeId: skip a just-depleted node so we don't re-claim it for one tick.
    */
   findWorkNode(
     x: number,
@@ -1012,8 +1213,9 @@ export class World {
       this.loadedChunks = new Set(data.loadedChunks);
       this.explored = new Set(data.explored);
       this.stockpile = data.stockpile;
-      this.coins = data.coins ?? { gold: 0, silver: 0, copper: 0 };
+      this.coins = normalizeCoins(data.coins ?? { gold: 0, silver: 0, copper: 0 });
       this.inventory = data.inventory ?? createEmptyInventory();
+      normalizeEquipped(this.inventory);
       this.inventoryOpen = false;
       this.expectedIncome = { stone: 0, wood: 0, food: 0 };
       this.floatTexts = [];
@@ -1034,6 +1236,7 @@ export class World {
       this.pendingMove = null;
       this.pendingAttackId = null;
       this.pendingFishId = null;
+      this.shopInteractNpcId = null;
       this.pendingFishRespawns = data.pendingFishRespawns ?? [];
       this.entities = new Map();
       for (const e of data.entities) {
@@ -1055,11 +1258,17 @@ export class World {
           });
         } else if (e.kind === 'resourceNode') {
           const n = withPrev as ResourceNode;
+          const isFish = n.resource === 'fish';
+          const max = isFish
+            ? (n.maxRemaining ?? CONFIG.fishSpotMax)
+            : CONFIG.nodeCapacity;
           this.entities.set(n.id, {
             ...n,
-            maxRemaining: n.maxRemaining ?? CONFIG.nodeCapacity,
+            maxRemaining: max,
             replenishTimer: n.replenishTimer ?? 0,
-            remaining: Math.min(n.remaining ?? CONFIG.nodeCapacity, n.maxRemaining ?? CONFIG.nodeCapacity),
+            remaining: Math.min(n.remaining ?? max, max),
+            anchorX: n.anchorX ?? n.x,
+            anchorY: n.anchorY ?? n.y,
           });
         } else if (e.kind === 'hero') {
           const h = withPrev as Hero;
@@ -1093,6 +1302,14 @@ export class World {
             defenseLevel: en.defenseLevel ?? def.defenseLevel,
             damage: en.damage ?? def.maxHit,
           });
+        } else if (e.kind === 'npc') {
+          const n = withPrev as Npc;
+          // Migrate old save name
+          const name =
+            n.role === 'shop' && (n.name === 'Test Vendor' || !n.name)
+              ? 'Ebbe Greyho'
+              : n.name;
+          this.entities.set(n.id, { ...n, name });
         } else if (e.kind === 'loot') {
           this.entities.set(e.id, withPrev as LootPile);
         } else if (e.kind === 'base') {
@@ -1110,7 +1327,10 @@ export class World {
         }
       }
       const hero = this.hero();
-      if (hero) applyHeroStats(hero, this.inventory);
+      if (hero) {
+        if (hero.skills) normalizeSkills(hero.skills);
+        applyHeroStats(hero, this.inventory);
+      }
       this.paused = false;
       this.message = '';
       return true;

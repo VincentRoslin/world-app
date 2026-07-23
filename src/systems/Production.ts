@@ -1,3 +1,24 @@
+/**
+ * Village economy: workers, resource gather loop, buildings, node respawns.
+ *
+ * Worker mental model (phase state machine):
+ *   idle      — player unassigned; stands freely
+ *   toWork    — pathing to a stand slot beside a resource node
+ *   gathering — timer accumulates; every resourceTickInterval seconds take gatherAmount
+ *   toBase    — haul cargo to the base ring and deposit into stockpile
+ *   waiting   — job still mine/log/farm but every node of that type is empty;
+ *               stand still and snore (Renderer draws zzZ) until one refills
+ *   building  — blacksmith / base upgrade construction
+ *
+ * Resource nodes (stone/wood/food):
+ *   - Cap at CONFIG.nodeCapacity (300). When empty → replenishTimer runs.
+ *   - On timer end: World.relocateAndRefillNode moves the node near its anchor
+ *     so the map stays lively without nodes drifting across the world.
+ *   - Fish uses a separate pendingFishRespawns path in Fishing.ts.
+ *
+ * Workers only gather on the home chunk (World.findWorkNode filters isHomeTile).
+ */
+
 import { CONFIG } from '../config';
 import { dist } from '../core/math';
 import type { BaseBuilding, BlacksmithBuilding, ResourceKind, ResourceNode, Stockpile, Worker, WorkerJob } from '../core/types';
@@ -76,7 +97,9 @@ export function queueTrainWorker(world: World): boolean {
 }
 
 /**
- * Assign job and send worker to a free slot on the best matching resource node.
+ * Player clicked Mine / Log / Farm / Idle on a worker.
+ * Maps job → resource kind, claims nearest free stand slot, or enters waiting
+ * if every matching home node is depleted / full of workers.
  */
 export function assignWorkerJob(world: World, worker: Worker, job: WorkerJob): boolean {
   leaveConstruction(world, worker);
@@ -87,7 +110,7 @@ export function assignWorkerJob(world: World, worker: Worker, job: WorkerJob): b
   worker.carriedResource = null;
 
   if (job === 'idle') {
-    // Player chose Idle — stop work and stay put (free to move afterward).
+    // Explicit Idle: drop assignment entirely (not the same as "waiting for respawn").
     worker.job = 'idle';
     worker.phase = 'idle';
     clearWorkClaim(worker);
@@ -101,9 +124,10 @@ export function assignWorkerJob(world: World, worker: Worker, job: WorkerJob): b
 
   const found = world.findWorkNode(worker.x, worker.y, resource);
   if (!found) {
-    world.message = `No free ${resource} work available.`;
-    sendIdleNearBase(world, worker);
-    return false;
+    // Keep the job so they auto-resume when a node refills (snore UI).
+    world.message = `No free ${resource} work — worker is waiting for respawn.`;
+    enterWaiting(worker);
+    return true;
   }
 
   claimNode(worker, found.node, found.slot);
@@ -113,7 +137,10 @@ export function assignWorkerJob(world: World, worker: Worker, job: WorkerJob): b
   return true;
 }
 
-/** Advance production by one game tick (seconds-based timers decrement by gameTickSec). */
+/**
+ * One production tick: refill timers → train workers → each worker state machine
+ * → construction / base upgrade progress → recompute expected income for HUD.
+ */
 export function updateProductionOnTick(world: World): void {
   const dt = CONFIG.gameTickSec;
   updateNodeReplenish(world, dt);
@@ -273,29 +300,47 @@ function updateBaseUpgrade(world: World, dt: number): void {
   }
 }
 
+/**
+ * Tick down empty-node timers. Fish is skipped (Fishing.updateFishRespawns).
+ * When a timer hits 0, the node relocates near its spawn anchor and refills to 300.
+ */
 function updateNodeReplenish(world: World, dt: number): void {
   for (const e of world.entities.values()) {
     if (!e.alive || e.kind !== 'resourceNode') continue;
+    if (e.resource === 'fish') continue; // separate system in Fishing.ts
     if (e.replenishTimer > 0) {
       e.replenishTimer -= dt;
       if (e.replenishTimer <= 0) {
-        e.replenishTimer = 0;
-        e.remaining = e.maxRemaining;
+        world.relocateAndRefillNode(e);
       }
     }
   }
 }
 
+/** Drop node/slot reservation so another worker can take that stand. */
 function clearWorkClaim(worker: Worker): void {
   worker.targetNodeId = null;
   worker.slotIndex = -1;
 }
 
+/** Reserve a specific stand slot on a node (maxWorkersPerNode concurrent). */
 function claimNode(worker: Worker, node: ResourceNode, slot: number): void {
   worker.targetNodeId = node.id;
   worker.slotIndex = slot;
 }
 
+/**
+ * Job stays mine/log/farm (so HUD still shows assignment) but phase = waiting.
+ * Renderer shows animated zzz; updateWorkerCycle re-polls findWorkNode each tick.
+ */
+function enterWaiting(worker: Worker): void {
+  worker.phase = 'waiting';
+  clearWorkClaim(worker);
+  worker.gatherTimer = 0;
+  worker.order = { type: 'none' };
+}
+
+/** Fully unassign and park near the base (player-idle / no valid job). */
 function sendIdleNearBase(world: World, worker: Worker): void {
   worker.job = 'idle';
   worker.phase = 'idle';
@@ -305,18 +350,21 @@ function sendIdleNearBase(world: World, worker: Worker): void {
   issueMove(world, worker, park.x, park.y);
 }
 
+/**
+ * After deposit or when a node dies underfoot: find next work of the same type.
+ * Prefer depositing cargo first so stockpile never loses carried resources.
+ * excludeId avoids instantly re-picking a just-depleted node.
+ */
 function reassignOrIdle(world: World, worker: Worker, resource: ResourceKind, excludeId: number | null): void {
-  // Keep cargo if any — deposit first (retain target for job type only)
   if (worker.carried > 0) {
     worker.phase = 'toBase';
     sendToBase(world, worker);
     return;
   }
-  // Free current slot so it can be reclaimed / used by others
   clearWorkClaim(worker);
   const found = world.findWorkNode(worker.x, worker.y, resource, excludeId);
   if (!found) {
-    sendIdleNearBase(world, worker);
+    enterWaiting(worker);
     return;
   }
   claimNode(worker, found.node, found.slot);
@@ -326,6 +374,10 @@ function reassignOrIdle(world: World, worker: Worker, resource: ResourceKind, ex
   issueGather(worker, found.node.id);
 }
 
+/**
+ * Core worker FSM step. Called once per game tick per living worker.
+ * Builders are handled in updateConstruction / updateBaseUpgrade instead.
+ */
 function updateWorkerCycle(world: World, worker: Worker, dt: number): void {
   if (worker.job === 'build') return;
   if (worker.job === 'idle') {
@@ -338,6 +390,19 @@ function updateWorkerCycle(world: World, worker: Worker, dt: number): void {
   const resource = world.resourceForJob(worker.job);
   if (!resource) {
     sendIdleNearBase(world, worker);
+    return;
+  }
+
+  // Poll for newly available nodes (after relocateAndRefillNode fills stock).
+  if (worker.phase === 'waiting') {
+    worker.order = { type: 'none' };
+    worker.gatherTimer = 0;
+    const found = world.findWorkNode(worker.x, worker.y, resource);
+    if (found) {
+      claimNode(worker, found.node, found.slot);
+      worker.phase = 'toWork';
+      issueGather(worker, found.node.id);
+    }
     return;
   }
 
@@ -497,26 +562,47 @@ function depositPoints(gx: number, gy: number): { x: number; y: number }[] {
   ];
 }
 
+/**
+ * Send worker to a deposit tile on the base ring.
+ * Spreads targets: pure "nearest" funnels every farmer through one corner and
+ * they collide. Score = distance + occupancy penalty + stable id bias so each
+ * worker prefers a different door when several are free.
+ */
 function sendToBase(world: World, worker: Worker): void {
   const base = world.base();
   const origin = world.baseFootprintOrigin();
   if (!base || !origin) return;
 
-  // Nearest *walkable* deposit tile outside the solid base
+  // How many other workers are already heading to each deposit tile?
+  const load = new Map<string, number>();
+  for (const e of world.entities.values()) {
+    if (!e.alive || e.kind !== 'worker' || e.id === worker.id) continue;
+    if (e.phase !== 'toBase' && e.order.type !== 'move') continue;
+    if (e.order.type === 'move') {
+      const k = `${e.order.tx},${e.order.ty}`;
+      load.set(k, (load.get(k) ?? 0) + 1);
+    }
+  }
+
   let best = { x: base.spawnX, y: base.spawnY };
-  let bestD = Infinity;
-  for (const p of depositPoints(origin.gx, origin.gy)) {
+  let bestScore = Infinity;
+  const points = depositPoints(origin.gx, origin.gy);
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i]!;
     const tx = Math.floor(p.x);
     const ty = Math.floor(p.y);
     if (!world.isWalkable(tx, ty)) continue;
     const d = dist(worker.x, worker.y, p.x, p.y);
-    if (d < bestD) {
-      bestD = d;
+    const occ = load.get(`${tx},${ty}`) ?? 0;
+    // Stable per-worker preference so two equal doors don't thrash every tick
+    const idBias = ((worker.id * 7 + i * 3) % points.length) * 0.08;
+    const score = d + occ * 1.35 + idBias;
+    if (score < bestScore) {
+      bestScore = score;
       best = p;
     }
   }
-  // Fallback to spawn if set and walkable
-  if (bestD === Infinity && world.isWalkable(Math.floor(base.spawnX), Math.floor(base.spawnY))) {
+  if (bestScore === Infinity && world.isWalkable(Math.floor(base.spawnX), Math.floor(base.spawnY))) {
     best = { x: base.spawnX, y: base.spawnY };
   }
   issueMove(world, worker, best.x, best.y);
@@ -544,7 +630,7 @@ function computeExpectedIncome(world: World): Stockpile {
   const income: Stockpile = { stone: 0, wood: 0, food: 0 };
   for (const e of world.entities.values()) {
     if (!e.alive || e.kind !== 'worker') continue;
-    if (e.job === 'idle') continue;
+    if (e.job === 'idle' || e.phase === 'waiting') continue;
     const resource = world.resourceForJob(e.job);
     if (!resource || resource === 'fish') continue;
     income[resource] += CONFIG.gatherAmount;

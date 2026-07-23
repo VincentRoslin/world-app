@@ -1,19 +1,20 @@
 import { CONFIG } from '../config';
 import { Input } from '../input/Input';
-import { Minimap } from '../render/Minimap';
 import { Renderer } from '../render/Renderer';
 import { advanceClock, processGameTick } from '../systems/GameTick';
 import { updateMovement } from '../systems/Movement';
 import { Hud } from '../ui/hud';
 import { InventoryUi } from '../ui/inventory';
+import { MapChrome } from '../ui/mapChrome';
 import { ShopUi } from '../ui/shop';
 import { World } from '../world/World';
 import { updateExploration } from '../systems/Exploration';
+import { updateShopInteract } from '../systems/ShopInteract';
 
 export class Game {
   world = new World();
   renderer: Renderer;
-  minimap: Minimap;
+  mapChrome: MapChrome;
   input: Input;
   hud: Hud;
   inventoryUi: InventoryUi;
@@ -21,15 +22,18 @@ export class Game {
   private last = 0;
   private raf = 0;
 
-  constructor(canvas: HTMLCanvasElement, minimapCanvas: HTMLCanvasElement) {
+  constructor(
+    canvas: HTMLCanvasElement,
+    minimapCanvas: HTMLCanvasElement,
+    fullMapCanvas: HTMLCanvasElement,
+  ) {
     this.renderer = new Renderer(canvas);
-    this.minimap = new Minimap(minimapCanvas);
+    this.mapChrome = new MapChrome(this.world, minimapCanvas, fullMapCanvas);
     this.inventoryUi = new InventoryUi(this.world);
     this.shopUi = new ShopUi(this.world);
     this.input = new Input(canvas, this.world, this.renderer, {
       onToggleCharacter: () => this.inventoryUi.toggleCharacter(),
       onToggleBags: () => this.inventoryUi.toggleAllBags(),
-      onOpenShop: (name) => this.shopUi.openShop(name),
     });
     this.hud = new Hud(
       this.world,
@@ -44,8 +48,8 @@ export class Game {
   restart(): void {
     this.world.reset(42);
     this.renderer.resize();
-    const base = this.world.base();
-    if (base) this.renderer.centerOn(base.x, base.y);
+    this.input.resetCameraFollow();
+    this.input.applyCameraFollow();
     updateExploration(this.world);
     this.inventoryUi.close();
     this.shopUi.close();
@@ -68,8 +72,8 @@ export class Game {
     }
     if (this.world.fromJSON(raw)) {
       this.renderer.resize();
-      const base = this.world.base();
-      if (base) this.renderer.centerOn(base.x, base.y);
+      this.input.resetCameraFollow();
+      this.input.applyCameraFollow();
       this.inventoryUi.close();
       this.shopUi.close();
     }
@@ -92,10 +96,11 @@ export class Game {
 
   /**
    * Frame loop:
-   * 1) input (camera + queue intents)
+   * 1) input (free pan unlocks soft camera lock)
    * 2) continuous movement @ heroSpeed
    * 3) discrete game ticks: intents → combat → production (0.6s)
-   * 4) render / HUD
+   * 4) soft camera follow on hero (if locked)
+   * 5) render / HUD
    */
   private tick(dt: number): void {
     this.input.update(dt);
@@ -103,6 +108,14 @@ export class Game {
     if (!this.world.paused && this.world.status === 'playing') {
       const sim = dt * this.world.timeScale;
       updateMovement(this.world, sim);
+      // Vendor approach after movement so range check is current
+      const shopNpcId = updateShopInteract(this.world);
+      if (shopNpcId != null) {
+        const npc = this.world.get(shopNpcId);
+        if (npc && npc.kind === 'npc') {
+          this.shopUi.openShop(npc.name, npc.id, true);
+        }
+      }
       this.world.updateFloatTexts(sim);
       const n = advanceClock(this.world, sim);
       for (let i = 0; i < n; i++) {
@@ -110,9 +123,14 @@ export class Game {
       }
     }
 
+    // After movement so follow tracks the hero; skipped when WASD/pan unlocked
+    this.input.applyCameraFollow();
+
+    this.shopUi.update();
+
     this.renderer.tickAlpha = 1;
     this.renderer.render(this.world);
-    this.minimap.render(this.world);
+    this.mapChrome.render();
     this.hud.update();
     this.inventoryUi.update();
   }

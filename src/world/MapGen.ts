@@ -1,6 +1,9 @@
 import { CONFIG, type EnemySpeciesId } from '../config';
 import type { ResourceKind, Tile } from '../core/types';
 
+// Note: land resource nodes use CONFIG.nodeMinSeparation (Chebyshev) so worker
+// stand tiles around each node stay exclusive — simpler than fancy path dodge.
+
 export function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
@@ -110,6 +113,16 @@ export interface ChunkContent {
   workers?: { x: number; y: number }[];
 }
 
+/**
+ * Procedural content for one chunk before World materializes entities/tiles.
+ *
+ * Home chunk (0,0): safe base, tight resource clusters (stone NW, wood NE, food SE),
+ * pond + fishing spots, starter workers — no enemy packs.
+ * Wild chunks: noise terrain, streams, random resources, chance of packs.
+ *
+ * Resource placement note: stone/wood/food use adjacent-ish tiles (like stone's
+ * original triangle) so work sites read as clear "camps" for workers.
+ */
 export function generateHomeChunk(worldSeed: number): ChunkContent {
   const size = CONFIG.chunkSize;
   const tiles: ChunkContent['tiles'] = [];
@@ -159,13 +172,26 @@ export function generateHomeChunk(worldSeed: number): ChunkContent {
     `${baseGx},${baseGy + 1}`,
     `${baseGx + 1},${baseGy + 1}`,
   ]);
+  /** Placed land-node centers (for min separation). */
+  const nodeCells: { gx: number; gy: number }[] = [];
+  const minSep = CONFIG.nodeMinSeparation;
+
+  const farEnough = (gx: number, gy: number): boolean => {
+    for (const n of nodeCells) {
+      const cheb = Math.max(Math.abs(n.gx - gx), Math.abs(n.gy - gy));
+      if (cheb < minSep) return false;
+    }
+    return true;
+  };
 
   const place = (resource: ResourceKind, lx: number, ly: number) => {
     const gx = ox + lx;
     const gy = oy + ly;
     const key = `${gx},${gy}`;
     if (used.has(key)) return;
+    if (!farEnough(gx, gy)) return;
     used.add(key);
+    nodeCells.push({ gx, gy });
     const t = tileAt.get(key);
     if (t) {
       t.tile.blocked = true;
@@ -175,16 +201,18 @@ export function generateHomeChunk(worldSeed: number): ChunkContent {
     resources.push({ x: gx + 0.5, y: gy + 0.5, resource });
   };
 
-  // Relative to 32×32 home chunk (was tuned for 16×16)
-  place('stone', 4, 5);
-  place('stone', 5, 6);
+  // Home resources: still grouped by region, but ≥ nodeMinSeparation apart so
+  // stand rings (N/E/S/W of each node) don’t share tiles → less worker jams.
+  // Stone NW · Wood NE · Food/oats SE (near pond)
+  place('stone', 3, 4);
+  place('stone', 3, 7);
   place('stone', 6, 4);
-  place('wood', 22, 4);
-  place('wood', 24, 6);
-  place('wood', 20, 8);
-  place('food', 18, 22);
-  place('food', 20, 24);
-  place('food', 16, 20);
+  place('wood', 21, 4);
+  place('wood', 21, 7);
+  place('wood', 24, 4);
+  place('food', 16, 21);
+  place('food', 16, 24);
+  place('food', 19, 21);
 
   // Small fishing pond in the southwest corner (3×3 water + shore)
   const pondTiles: { gx: number; gy: number }[] = [];
@@ -260,19 +288,33 @@ export function generateWildChunk(worldSeed: number, cx: number, cy: number): Ch
 
   const resources: ChunkContent['resources'] = [];
   const kinds: ResourceKind[] = ['stone', 'wood', 'food'];
+  const nodeCells: { gx: number; gy: number }[] = [];
+  const minSep = CONFIG.nodeMinSeparation;
   // ~2.5× the old 16×16 counts (not full 4×) so density stays playable on 32×32
   const resCount = 5 + Math.floor(rand() * 7);
-  for (let i = 0; i < resCount; i++) {
+  let attempts = 0;
+  while (resources.length < resCount && attempts < resCount * 24) {
+    attempts++;
     const lx = 1 + Math.floor(rand() * (size - 2));
     const ly = 1 + Math.floor(rand() * (size - 2));
     const gx = ox + lx;
     const gy = oy + ly;
     const t = tileAt.get(`${gx},${gy}`);
     if (!t || t.tile.blocked) continue;
+    // Keep land nodes spaced so stand slots don't overlap
+    let ok = true;
+    for (const n of nodeCells) {
+      if (Math.max(Math.abs(n.gx - gx), Math.abs(n.gy - gy)) < minSep) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
     t.tile.blocked = true;
     const resource = kinds[Math.floor(rand() * kinds.length)]!;
     if (resource === 'stone') t.tile.terrain = 'dirt';
     t.tile.decoration = undefined;
+    nodeCells.push({ gx, gy });
     resources.push({ x: gx + 0.5, y: gy + 0.5, resource });
   }
 

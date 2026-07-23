@@ -24,7 +24,7 @@ export class Hud {
   private overlayTitle = el('overlay-title');
   private overlayMsg = el('overlay-msg');
   private btnPause = document.getElementById('btn-pause') as HTMLButtonElement;
-  private btnSpeed = document.getElementById('btn-speed') as HTMLButtonElement;
+  private pauseOverlay = document.getElementById('pause-overlay')!;
   private panelKey = '';
   private buildTabWorkerId: number | null = null;
 
@@ -36,11 +36,7 @@ export class Hud {
 
     this.btnPause.addEventListener('click', () => {
       this.world.paused = !this.world.paused;
-      this.btnPause.textContent = this.world.paused ? '▶' : '❚❚';
-    });
-    this.btnSpeed.addEventListener('click', () => {
-      this.world.timeScale = this.world.timeScale === 1 ? 2 : this.world.timeScale === 2 ? 3 : 1;
-      this.btnSpeed.textContent = `${this.world.timeScale}×`;
+      this.syncPauseUi();
     });
     document.getElementById('btn-save')!.addEventListener('click', () => this.onSave());
     document.getElementById('btn-load')!.addEventListener('click', () => this.onLoad());
@@ -112,6 +108,7 @@ export class Hud {
     this.exploreEl.textContent = `Explored ${explored} · Chunks ${w.loadedChunks.size} · Map ${loaded} tiles`;
 
     this.renderSelection();
+    this.syncPauseUi();
 
     if (w.status === 'won' || w.status === 'lost') {
       this.overlay.classList.remove('hidden');
@@ -120,6 +117,14 @@ export class Hud {
     } else {
       this.overlay.classList.add('hidden');
     }
+  }
+
+  private syncPauseUi(): void {
+    const paused = this.world.paused && this.world.status === 'playing';
+    this.btnPause.textContent = paused ? 'Play' : 'Pause';
+    this.btnPause.title = paused ? 'Resume' : 'Pause';
+    this.pauseOverlay.classList.toggle('hidden', !paused);
+    this.pauseOverlay.setAttribute('aria-hidden', paused ? 'false' : 'true');
   }
 
   private setIncome(node: HTMLElement, amount: number): void {
@@ -196,9 +201,11 @@ export class Hud {
               ? `Returning to base${e.carried > 0 ? ` (carrying ${e.carried})` : ''}`
               : e.phase === 'building'
                 ? (e.constructionId != null && this.world.get(e.constructionId)?.kind === 'base' ? 'Upgrading base' : 'Constructing building')
-              : 'Idle near base';
+                : e.phase === 'waiting'
+                  ? 'Waiting for resources… zzz'
+                  : 'Idle near base';
       this.detailEl.textContent = `HP ${Math.ceil(e.hp)}/${e.maxHp} · ${phaseLabel}`;
-      const actionKey = `worker-btns:${e.id}:${e.job}`;
+      const actionKey = `worker-btns:${e.id}:${e.job}:${e.phase}`;
       if (this.panelKey !== actionKey) {
         this.actionsEl.innerHTML = '';
         for (const job of ['idle', 'mine', 'log', 'farm'] as const) {
@@ -284,7 +291,7 @@ export class Hud {
       this.titleEl.textContent = e.name;
       this.detailEl.textContent =
         e.role === 'shop'
-          ? 'Test Vendor — RMB to open free shop (dev).'
+          ? 'Ebbe Greyho — RMB to walk over and open free shop.'
           : 'Friendly NPC.';
       if (this.panelKey !== key) {
         this.actionsEl.innerHTML = '';
@@ -308,12 +315,23 @@ export class Hud {
     }
 
     if (e.kind === 'resourceNode') {
-      const resName = e.resource === 'stone' ? 'Stone Deposit' : e.resource === 'wood' ? 'Forest' : e.resource === 'fish' ? 'Fishing Spot' : 'Farm';
+      const resName =
+        e.resource === 'stone'
+          ? 'Stone Deposit'
+          : e.resource === 'wood'
+            ? 'Forest'
+            : e.resource === 'fish'
+              ? 'Fishing Spot'
+              : 'Oat Field';
       const remaining = e.remaining;
       const max = e.maxRemaining > 0 ? e.maxRemaining : CONFIG.nodeCapacity;
       const pct = Math.floor((remaining / max) * 100);
       this.titleEl.textContent = resName;
-      this.detailEl.textContent = `Remaining: ${Math.floor(remaining)}/${max} (${pct}%) · ${CONFIG.maxWorkersPerNode} workers max`;
+      const regen =
+        e.replenishTimer > 0
+          ? ` · Respawning nearby in ${Math.ceil(e.replenishTimer)}s`
+          : '';
+      this.detailEl.textContent = `Remaining: ${Math.floor(remaining)}/${max} (${pct}%) · ${CONFIG.maxWorkersPerNode} workers max${regen}`;
       if (this.panelKey !== key) {
         this.actionsEl.innerHTML = '';
         this.panelKey = key;

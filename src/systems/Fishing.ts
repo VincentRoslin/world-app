@@ -22,7 +22,7 @@ export function clearFishing(hero: Hero): void {
   hero.fishingNodeId = null;
 }
 
-/** Queue fishing on the next game tick (OSRS-style intent). */
+/** Queue fishing on the next game tick. */
 export function queueFish(world: World, nodeId: EntityId): void {
   if (world.status !== 'playing') return;
   const hero = world.hero();
@@ -36,6 +36,7 @@ export function queueFish(world: World, nodeId: EntityId): void {
   world.selectedId = hero.id;
   world.pendingMove = null;
   world.pendingAttackId = null;
+  world.shopInteractNpcId = null;
   world.pendingFishId = nodeId;
   world.message = 'Fishing…';
 }

@@ -1,5 +1,11 @@
 import { CONFIG } from '../config';
-import { getItemDef, itemAttackBonus, itemDefenseBonus, itemStrengthBonus } from '../items/catalog';
+import {
+  getItemDef,
+  itemAttackBonus,
+  itemDefenseBonus,
+  itemStrengthBonus,
+  rarityColor,
+} from '../items/catalog';
 import type {
   EquipKey,
   EquipSlot,
@@ -24,6 +30,10 @@ export function createEmptyInventory(): Inventory {
   };
 }
 
+/**
+ * Sum bonuses from every equipped item.
+ * Bags / inventory items do NOT count — only paper-doll slots.
+ */
 export function getStats(inv: Inventory): GearStats {
   const stats: GearStats = {
     attackBonus: 0,
@@ -44,20 +54,62 @@ export function getStats(inv: Inventory): GearStats {
   return stats;
 }
 
-/** Max hit estimate (squished OSRS-inspired). */
+/**
+ * Melee max hit from Strength level + equipment strength bonus.
+ *
+ * Why this formula exists:
+ * - Strength level is the main "I hit harder" lever.
+ * - Gear strengthBonus multiplies with the effective level (not pure additive).
+ * - The +8 and /640 constants scale so low levels still deal ≥1 damage.
+ *
+ * effectiveStrength = Strength + styleBonus + 8
+ *   (styleBonus = +3 "aggressive" — we dual-train Atk/Str XP but lean damage)
+ * maxHit = floor(0.5 + effectiveStrength * (equipmentStrength + 64) / 640)
+ *
+ * Used by Combat.rollHeroHit and shown on the Character stats panel.
+ */
 export function estimateMaxHit(skills: Skills, inv: Inventory): number {
   const gear = getStats(inv);
-  const effStr = skills.strength.level + Math.floor(gear.strengthBonus / 3);
-  return Math.max(1, 1 + Math.floor((effStr * (gear.strengthBonus + 64)) / 640));
+  const styleBonus = 3; // Aggressive stance bonus
+  const effectiveStrength = skills.strength.level + styleBonus + 8;
+  const equipmentStrength = gear.strengthBonus;
+  const maxHit = Math.floor(0.5 + (effectiveStrength * (equipmentStrength + 64)) / 640);
+  return Math.max(1, maxHit);
 }
 
+/**
+ * Attack roll fed into Combat.meleeHitChance (higher → more hits land).
+ * effectiveAttack = Attack + styleBonus + 8
+ * (styleBonus = +1 "controlled" — middle ground matching dual Atk/Str XP grants)
+ *
+ * Roll = effectiveAttack * (gear attackBonus + 64)
+ * The +64 keeps bare-handed accuracy from collapsing to near-zero.
+ */
+export function attackRoll(skills: Skills, inv: Inventory): number {
+  const gear = getStats(inv);
+  const styleBonus = 1; // Controlled stance
+  const effectiveAttack = skills.attack.level + styleBonus + 8;
+  return effectiveAttack * (gear.attackBonus + 64);
+}
+
+/** Same structure as attackRoll, but for Defense when monsters swing at the hero. */
+export function defenceRoll(skills: Skills, inv: Inventory): number {
+  const gear = getStats(inv);
+  const styleBonus = 1; // Controlled / block-ish
+  const effectiveDefence = skills.defense.level + styleBonus + 8;
+  return effectiveDefence * (gear.defenseBonus + 64);
+}
+
+/** Base HP + Defense level + gear maxHp. */
 export function heroMaxHp(skills: Skills, inv: Inventory): number {
   const gear = getStats(inv);
   return CONFIG.heroHp + skills.defense.level + gear.maxHp;
 }
 
 /**
- * Apply gear + skills onto hero. Only equipped items count.
+ * Push derived combat stats onto the hero entity after equip / level-up.
+ * Only equipped items count (see getStats).
+ * Clamps current HP so a max-HP drop never leaves you over full.
  */
 export function applyHeroStats(hero: Hero, inv: Inventory): void {
   const s = getStats(inv);
@@ -216,8 +268,16 @@ export function setBagItem(
   if (b) b[index] = item;
 }
 
-function equipKeyForSlot(slot: EquipSlot): EquipKey | null {
+/** Pick paper-doll key for a catalog slot (rings fill ring1 then ring2). */
+function equipKeyForSlot(inv: Inventory, slot: EquipSlot): EquipKey | null {
   if (slot === 'bag') return null;
+  if (slot === 'ring') {
+    if (!inv.equipped.ring1) return 'ring1';
+    if (!inv.equipped.ring2) return 'ring2';
+    return 'ring1'; // replace first when both full
+  }
+  if (slot === 'cloak') return 'cloak';
+  // Item slot names match equip keys for everything else
   return slot as EquipKey;
 }
 
@@ -225,7 +285,22 @@ export function canEquipTo(defSlot: EquipSlot | 'none', key: EquipKey): boolean 
   if (defSlot === 'none' || defSlot === 'bag') return false;
   if (defSlot === 'mainHand') return key === 'mainHand';
   if (defSlot === 'offHand') return key === 'offHand';
+  if (defSlot === 'ring') return key === 'ring1' || key === 'ring2';
+  if (defSlot === 'cloak') return key === 'cloak';
   return defSlot === key;
+}
+
+/** Ensure save data has all equip keys (migrate legacy `ring` → `ring1`). */
+export function normalizeEquipped(inv: Inventory): void {
+  const eq = inv.equipped as Record<string, ItemInstance | null>;
+  if (eq.ring != null && eq.ring1 == null) {
+    eq.ring1 = eq.ring;
+  }
+  delete eq.ring;
+  for (const k of EQUIP_KEYS) {
+    if (!(k in eq)) eq[k] = null;
+  }
+  inv.equipped = eq as Inventory['equipped'];
 }
 
 export function equipFromBag(
@@ -248,7 +323,7 @@ export function equipFromBag(
   const reqMsg = requirementMessage(skills, def.requirements);
   if (reqMsg) return { ok: false, message: reqMsg };
 
-  const key = targetKey ?? equipKeyForSlot(def.slot) ?? undefined;
+  const key = targetKey ?? equipKeyForSlot(inv, def.slot) ?? undefined;
   if (!key || !canEquipTo(def.slot, key)) {
     return { ok: false, message: 'Wrong equipment slot.' };
   }
@@ -304,30 +379,102 @@ export function unequipBag(inv: Inventory, bagSlot: number): boolean {
   return true;
 }
 
-export function itemTooltip(inst: ItemInstance, skills?: Skills): string {
+/**
+ * Plain multi-line tooltip text (newline-stacked, WoW-style).
+ * Prefer itemTooltipHtml for colored UI tooltips.
+ */
+export function itemTooltip(inst: ItemInstance, skills?: Skills, extraLine?: string): string {
+  return itemTooltipLines(inst, skills, extraLine).join('\n');
+}
+
+export interface TooltipLine {
+  text: string;
+  /** CSS class on the line (tt-name, tt-type, tt-stat, …) */
+  cls: string;
+  /** Optional inline color (rarity name, unmet req red). */
+  color?: string;
+}
+
+/** Structured lines for a vertical (downward-stacking) item tooltip. */
+export function itemTooltipLines(
+  inst: ItemInstance,
+  skills?: Skills,
+  extraLine?: string,
+): TooltipLine[] {
   const def = getItemDef(inst.defId);
-  if (!def) return 'Unknown item';
+  if (!def) return [{ text: 'Unknown item', cls: 'tt-name' }];
+
   const qty = inst.quantity ?? 1;
-  const parts = [qty > 1 ? `${def.name} ×${qty}` : def.name, `(${def.rarity})`];
+  const lines: TooltipLine[] = [];
+  const name = qty > 1 ? `${def.name} ×${qty}` : def.name;
+  lines.push({ text: name, cls: 'tt-name', color: rarityColor(def.rarity) });
+
+  // Type line: "Uncommon Sword" / "Rare Chest" etc.
+  const slotLabel =
+    def.slot === 'mainHand' || def.slot === 'offHand'
+      ? (def.weaponType ?? def.slot)
+      : def.slot === 'none'
+        ? 'Misc'
+        : def.slot === 'bag'
+          ? 'Bag'
+          : def.slot;
+  const rarityLabel = def.rarity.charAt(0).toUpperCase() + def.rarity.slice(1);
+  lines.push({
+    text: `${rarityLabel} ${slotLabel}`,
+    cls: 'tt-type',
+    color: rarityColor(def.rarity),
+  });
+
   const atk = itemAttackBonus(def);
   const str = itemStrengthBonus(def);
   const defb = itemDefenseBonus(def);
-  if (atk) parts.push(`+${atk} Atk`);
-  if (str) parts.push(`+${str} Str`);
-  if (defb) parts.push(`+${defb} Def`);
-  if (def.maxHp) parts.push(`+${def.maxHp} HP`);
-  if (def.bagSlots) parts.push(`${def.bagSlots} slots`);
-  if (def.id === 'raw_fish') parts.push('Heals 3 HP');
+  if (atk) lines.push({ text: `+${atk} Attack`, cls: 'tt-stat' });
+  if (str) lines.push({ text: `+${str} Strength`, cls: 'tt-stat' });
+  if (defb) lines.push({ text: `+${defb} Defense`, cls: 'tt-stat' });
+  if (def.maxHp) lines.push({ text: `+${def.maxHp} Health`, cls: 'tt-stat' });
+  if (def.bagSlots) lines.push({ text: `${def.bagSlots} bag slots`, cls: 'tt-stat' });
+  if (def.id === 'raw_fish') lines.push({ text: 'Use: Restores 3 Health', cls: 'tt-use' });
+
   const max = maxStackFor(inst.defId);
-  if (max > 1) parts.push(`Stack ${qty}/${max}`);
+  if (max > 1) lines.push({ text: `Stack: ${qty} / ${max}`, cls: 'tt-meta' });
+
   if (def.requirements) {
     const bits: string[] = [];
-    if (def.requirements.attack) bits.push(`Atk ${def.requirements.attack}`);
-    if (def.requirements.strength) bits.push(`Str ${def.requirements.strength}`);
-    if (def.requirements.defense) bits.push(`Def ${def.requirements.defense}`);
-    if (def.requirements.fishing) bits.push(`Fish ${def.requirements.fishing}`);
+    if (def.requirements.attack) bits.push(`Attack ${def.requirements.attack}`);
+    if (def.requirements.strength) bits.push(`Strength ${def.requirements.strength}`);
+    if (def.requirements.defense) bits.push(`Defense ${def.requirements.defense}`);
+    if (def.requirements.fishing) bits.push(`Fishing ${def.requirements.fishing}`);
     const ok = skills ? meetsRequirements(skills, def.requirements) : true;
-    parts.push(ok ? `Req: ${bits.join(', ')}` : `Req: ${bits.join(', ')} (not met)`);
+    lines.push({
+      text: `Requires ${bits.join(', ')}`,
+      cls: ok ? 'tt-req' : 'tt-req tt-req-fail',
+      color: ok ? undefined : '#f85149',
+    });
   }
-  return parts.join(' · ');
+
+  if (extraLine) lines.push({ text: extraLine, cls: 'tt-extra' });
+  return lines;
+}
+
+/** HTML for inv/shop tooltip — lines stack top → bottom like classic RPG tooltips. */
+export function itemTooltipHtml(
+  inst: ItemInstance,
+  skills?: Skills,
+  extraLine?: string,
+): string {
+  return itemTooltipLines(inst, skills, extraLine)
+    .map((ln) => {
+      const style = ln.color ? ` style="color:${ln.color}"` : '';
+      const safe = escapeHtml(ln.text);
+      return `<div class="tt-line ${ln.cls}"${style}>${safe}</div>`;
+    })
+    .join('');
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }

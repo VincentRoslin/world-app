@@ -5,10 +5,32 @@ import type { Enemy, EntityId, Hero } from '../core/types';
 import type { World } from '../world/World';
 import { issueAttack, issueMove } from './Movement';
 import { spawnLootAt } from './Loot';
-import { applyHeroStats, estimateMaxHit, getStats } from './Inventory';
-import { addSkillXp, skillLabel, type LevelUpEvent } from './Skills';
+import {
+  applyHeroStats,
+  attackRoll,
+  defenceRoll,
+  estimateMaxHit,
+} from './Inventory';
+import {
+  addSkillXp,
+  XP_PER_HIT,
+  skillLabel,
+  type LevelUpEvent,
+} from './Skills';
 
-/** Orthogonal tile adjacency (OSRS-style melee). */
+/**
+ * Combat system (tick-based).
+ *
+ * High-level flow each game tick (see GameTick.processGameTick → onGameTickCombat):
+ * 1. Maintain fight queue / pack join / leash (soft death: escape by distance).
+ * 2. Alternate hero ↔ front-enemy swings when both are in melee.
+ * 3. Accuracy = meleeHitChance(attackRoll, defenceRoll); damage uniform 0..maxHit.
+ * 4. Grant XP: one step (XP_PER_HIT) only when damage > 0 — no XP on misses / zero rolls.
+ *
+ * Melee is orthogonal adjacency only (no diagonal) so positioning stays readable.
+ */
+
+/** True when A and B share an edge (N/E/S/W). Diagonal does not count. */
 function inMeleeRange(ax: number, ay: number, bx: number, by: number): boolean {
   const dx = Math.abs(Math.floor(ax) - Math.floor(bx));
   const dy = Math.abs(Math.floor(ay) - Math.floor(by));
@@ -75,6 +97,7 @@ export function clearHeroCombat(world: World, hero: Hero): void {
   if (hero.order.type === 'attack') hero.order = { type: 'none' };
   // Drop queued player intents so a stale attack cannot re-engage next tick
   world.pendingAttackId = null;
+  world.shopInteractNpcId = null;
   // pendingMove left alone — flee may have just been queued
 }
 
@@ -337,7 +360,7 @@ function speciesName(e: Enemy): string {
 }
 
 /**
- * Combat + AI phase for one OSRS game tick (called from GameTick orchestrator).
+ * Combat + AI phase for one game tick (called from GameTick orchestrator).
  * No continuous dt — decisions and swings are discrete.
  */
 export function onGameTickCombat(world: World): void {
@@ -531,6 +554,11 @@ function processCombatSwings(world: World): void {
   }
 }
 
+/**
+ * Resolve one hero weapon swing. Resets attackTimer to weapon speed (ticks).
+ * XP: only when damage > 0 (misses and 0-damage rolls grant nothing).
+ * One training step per successful hit to Attack + Strength (not scaled by damage).
+ */
 function processHeroAttackTick(world: World, hero: Hero, target: Enemy): void {
   hero.attackTimer = hero.attackTicks;
   hero.combatTimer = 0;
@@ -538,13 +566,12 @@ function processHeroAttackTick(world: World, hero: Hero, target: Enemy): void {
   const hit = rollHeroHit(world, hero, target);
   if (hit.damage <= 0) {
     world.spawnFloatText(target.x, target.y, '0', '#58a6ff');
-    grantXp(world, hero, 'attack', 1);
     return;
   }
   target.hp -= hit.damage;
   world.spawnFloatText(target.x, target.y, `-${hit.damage}`, '#f85149');
-  grantXp(world, hero, 'attack', 1 + hit.damage);
-  grantXp(world, hero, 'strength', 1 + hit.damage);
+  grantXp(world, hero, 'attack', XP_PER_HIT);
+  grantXp(world, hero, 'strength', XP_PER_HIT);
 }
 
 function processEnemyAttackTick(world: World, enemy: Enemy, hero: Hero): void {
@@ -555,12 +582,11 @@ function processEnemyAttackTick(world: World, enemy: Enemy, hero: Hero): void {
   const dmg = rollEnemyHit(world, hero, enemy);
   if (dmg <= 0) {
     world.spawnFloatText(hero.x, hero.y, '0', '#58a6ff');
-    grantXp(world, hero, 'defense', 1);
     return;
   }
   hero.hp -= dmg;
   world.spawnFloatText(hero.x, hero.y, `-${dmg}`, '#ffa198');
-  grantXp(world, hero, 'defense', 1 + dmg);
+  grantXp(world, hero, 'defense', XP_PER_HIT);
 
   if (hero.hp <= 0) {
     hero.hp = 0;
@@ -783,29 +809,49 @@ function updateEnemyMovementAi(world: World, enemy: Enemy, hero: Hero | undefine
   }
 }
 
+/**
+ * Probability a hit lands given attack roll A vs defence roll D.
+ *
+ *   if A > D:  1 − (D+2) / (2*(A+1))   // favored attacker
+ *   else:      A / (2*(D+1))           // underdog still has a chance
+ *
+ * Separating accuracy from damage means Attack skill and Strength skill
+ * matter differently (hit more often vs hit harder).
+ */
+function meleeHitChance(atkRoll: number, defRoll: number): number {
+  const A = Math.max(0, atkRoll);
+  const D = Math.max(0, defRoll);
+  if (A > D) return 1 - (D + 2) / (2 * (A + 1));
+  return A / (2 * (D + 1));
+}
+
+/**
+ * One hero swing: accuracy check, then flat roll 0..maxHit inclusive.
+ * Returning { damage: 0 } is a miss or a 0-damage roll (UI shows "0"; no skill XP).
+ */
 function rollHeroHit(world: World, hero: Hero, target: Enemy): { damage: number } {
-  const gear = getStats(world.inventory);
   const maxHit = estimateMaxHit(hero.skills, world.inventory);
-  const effAtk = hero.skills.attack.level + Math.floor(gear.attackBonus / 3);
-  const enemyDef = target.defenseLevel + 1;
-  const atkRoll = 1 + effAtk + Math.floor(gear.attackBonus / 2);
-  const defRoll = 1 + enemyDef * 2;
-  const hitChance = Math.min(0.95, Math.max(0.4, atkRoll / (atkRoll + defRoll)));
-  if (Math.random() > hitChance) return { damage: 0 };
-  const dmg = 1 + Math.floor(Math.random() * maxHit);
-  return { damage: Math.min(dmg, maxHit) };
+  const aRoll = attackRoll(hero.skills, world.inventory);
+  // NPCs skip gear: (defenseLevel + 9) * 64 mimics bare defence gear factor.
+  const dRoll = (target.defenseLevel + 9) * 64;
+  const chance = meleeHitChance(aRoll, dRoll);
+  if (Math.random() > chance) return { damage: 0 };
+  // Uniform 0..maxHit after a successful accuracy roll (0 still possible on a "hit").
+  const dmg = Math.floor(Math.random() * (maxHit + 1));
+  return { damage: dmg };
 }
 
+/** Monster swing at the hero — same accuracy model, damage capped at enemy.damage. */
 function rollEnemyHit(world: World, hero: Hero, enemy: Enemy): number {
-  const gear = getStats(world.inventory);
-  const effDef = hero.skills.defense.level + Math.floor(gear.defenseBonus / 3);
-  const atkRoll = 1 + enemy.damage * 2;
-  const defRoll = 1 + effDef + Math.floor(gear.defenseBonus / 2);
-  const hitChance = Math.min(0.55, Math.max(0.08, atkRoll / (atkRoll + defRoll + 6)));
-  if (Math.random() > hitChance) return 0;
-  return Math.max(1, enemy.damage);
+  // Use enemy.damage as a stand-in for "attack level" on the monster side.
+  const aRoll = (enemy.damage + 8) * 64;
+  const dRoll = defenceRoll(hero.skills, world.inventory);
+  const chance = meleeHitChance(aRoll, dRoll);
+  if (Math.random() > chance) return 0;
+  return Math.floor(Math.random() * (enemy.damage + 1));
 }
 
+/** Add skill XP, announce multi-level-ups, refresh hero max hit / HP if leveled. */
 function grantXp(
   world: World,
   hero: Hero,
@@ -817,10 +863,11 @@ function grantXp(
   if (events.length > 0) applyHeroStats(hero, world.inventory);
 }
 
+/** Small kill bonus (separate from per-hit training). */
 function grantKillXp(world: World, hero: Hero): void {
-  grantXp(world, hero, 'attack', 3);
-  grantXp(world, hero, 'strength', 3);
-  grantXp(world, hero, 'defense', 1);
+  grantXp(world, hero, 'attack', XP_PER_HIT);
+  grantXp(world, hero, 'strength', XP_PER_HIT);
+  grantXp(world, hero, 'defense', XP_PER_HIT);
 }
 
 function announceLevelUp(world: World, hero: Hero, ev: LevelUpEvent): void {

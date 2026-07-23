@@ -7,12 +7,13 @@ import {
   PAPER_DOLL_RIGHT,
   PAPER_DOLL_WEAPONS,
 } from '../items/types';
+import { drawHeroWithGear } from '../render/drawGear';
 import {
   applyHeroStats,
   equipFromBag,
   estimateMaxHit,
   getStats,
-  itemTooltip,
+  itemTooltipHtml,
   unequip,
   unequipBag,
 } from '../systems/Inventory';
@@ -20,7 +21,7 @@ import { xpProgress } from '../systems/Skills';
 import type { World } from '../world/World';
 import { itemIconHtml } from './itemIcon';
 
-type CharTab = 'inventory' | 'skills';
+type CharTab = 'character' | 'stats' | 'skills';
 
 export class InventoryUi {
   private world: World;
@@ -33,13 +34,16 @@ export class InventoryUi {
   private bagPanelsEl: HTMLElement;
   private bagBar: HTMLElement;
   private tooltipEl: HTMLElement;
+  private portraitCanvas: HTMLCanvasElement;
+  private previewCanvas: HTMLCanvasElement;
   private openBags = new Set<'main' | number>();
-  private activeTab: CharTab = 'inventory';
+  private activeTab: CharTab = 'character';
   private equipFingerprint = '';
   private bagBarFingerprint = '';
   private bagPanelsFingerprint = '';
   private centerStatsFingerprint = '';
   private skillsFingerprint = '';
+  private heroPaintFingerprint = '';
   /** Custom drag position (px). Null = default left-middle placement. */
   private charPos: { left: number; top: number } | null = null;
   private charDragging = false;
@@ -55,6 +59,8 @@ export class InventoryUi {
     this.bagPanelsEl = document.getElementById('bag-panels')!;
     this.bagBar = document.getElementById('bag-bar')!;
     this.tooltipEl = document.getElementById('inv-tooltip')!;
+    this.portraitCanvas = document.getElementById('char-portrait') as HTMLCanvasElement;
+    this.previewCanvas = document.getElementById('char-preview') as HTMLCanvasElement;
 
     document.getElementById('btn-character')?.addEventListener('click', () => this.toggleCharacter());
     document.getElementById('btn-char-close')?.addEventListener('click', () => this.closeCharacter());
@@ -157,8 +163,8 @@ export class InventoryUi {
       slot.className = 'inv-slot equip-slot';
       slot.dataset.equip = key;
       slot.title = EQUIP_LABELS[key];
-      /* icon band first, label band second — matches paper-doll CSS grid rows */
-      slot.innerHTML = `<span class="slot-icon"></span><span class="slot-label">${EQUIP_LABELS[key]}</span>`;
+      /* Icon only — name via tooltip (matches ref paper-doll) */
+      slot.innerHTML = `<span class="slot-icon"></span>`;
       slot.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -318,7 +324,8 @@ export class InventoryUi {
     this.charPanel.querySelectorAll('.char-tab').forEach((b) => {
       b.classList.toggle('active', (b as HTMLElement).dataset.tab === tab);
     });
-    document.getElementById('char-tab-inventory')?.classList.toggle('hidden', tab !== 'inventory');
+    document.getElementById('char-tab-character')?.classList.toggle('hidden', tab !== 'character');
+    document.getElementById('char-tab-stats')?.classList.toggle('hidden', tab !== 'stats');
     document.getElementById('char-tab-skills')?.classList.toggle('hidden', tab !== 'skills');
     this.refreshCharacter(true);
   }
@@ -376,11 +383,64 @@ export class InventoryUi {
       this.renderEquip();
       this.equipFingerprint = equipParts;
     }
-    if (this.activeTab === 'inventory') this.renderCenterStats(force);
+    this.updateCharHeader();
+    // Repaint previews when gear changes or panel just opened
+    if (force || equipParts !== this.heroPaintFingerprint) {
+      this.paintHeroSprites(true);
+      this.heroPaintFingerprint = equipParts;
+    }
+    if (this.activeTab === 'stats') this.renderCenterStats(force);
     if (this.activeTab === 'skills') this.renderSkills(force);
   }
 
-  /** Combat snapshot shown in the middle of the paper-doll. */
+  private updateCharHeader(): void {
+    const hero = this.world.hero();
+    const nameEl = document.getElementById('char-name');
+    const subEl = document.getElementById('char-subtitle');
+    if (!nameEl || !subEl) return;
+    nameEl.textContent = 'Hero';
+    if (!hero) {
+      subEl.textContent = 'No hero';
+      return;
+    }
+    const combatLv = Math.max(
+      hero.skills.attack.level,
+      hero.skills.strength.level,
+      hero.skills.defense.level,
+    );
+    const title =
+      combatLv >= 40 ? 'Veteran' : combatLv >= 20 ? 'Adventurer' : combatLv >= 10 ? 'Explorer' : 'Settler';
+    subEl.textContent = `Level ${combatLv} · ${title}`;
+  }
+
+  /** Draw equipped hero into portrait + center preview (game sprite). */
+  private paintHeroSprites(force: boolean): void {
+    if (!force && this.charPanel.classList.contains('hidden')) return;
+    const inv = this.world.inventory;
+    this.paintHeroOn(this.portraitCanvas, inv, 1.15);
+    this.paintHeroOn(this.previewCanvas, inv, 2.35);
+  }
+
+  private paintHeroOn(canvas: HTMLCanvasElement, inv: typeof this.world.inventory, scale: number): void {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const w = canvas.width;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    // Soft stage background
+    const g = ctx.createRadialGradient(w / 2, h * 0.45, 4, w / 2, h * 0.5, w * 0.55);
+    g.addColorStop(0, '#2a323c');
+    g.addColorStop(1, '#161b22');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+    ctx.save();
+    ctx.translate(w / 2, h * 0.78);
+    ctx.scale(scale, scale);
+    drawHeroWithGear(ctx, 0, 0, inv, { tileW: 64, tileH: 28 });
+    ctx.restore();
+  }
+
+  /** Combat / skill snapshot. */
   private renderCenterStats(force = false): void {
     const hero = this.world.hero();
     const inv = this.world.inventory;
@@ -389,23 +449,25 @@ export class InventoryUi {
     const totalMax = hero?.maxHp ?? CONFIG.heroHp + 1;
     const hpNow = hero ? Math.ceil(hero.hp) : 0;
     const skills = hero?.skills;
-    const lv = (id: 'attack' | 'strength' | 'defense') => skills?.[id]?.level ?? 1;
-    const fp = `${hpNow}|${totalMax}|${maxHit}|${lv('attack')}|${lv('strength')}|${lv('defense')}|${gear.attackBonus}|${gear.strengthBonus}|${gear.defenseBonus}`;
+    const lv = (id: 'attack' | 'strength' | 'defense' | 'fishing') => skills?.[id]?.level ?? 1;
+    const fp = `${hpNow}|${totalMax}|${maxHit}|${lv('attack')}|${lv('strength')}|${lv('defense')}|${lv('fishing')}|${gear.attackBonus}|${gear.strengthBonus}|${gear.defenseBonus}|${gear.maxHp}`;
     if (!force && fp === this.centerStatsFingerprint) return;
     this.centerStatsFingerprint = fp;
     this.pdCenterStats.innerHTML = `
-      <div class="stats-title">Character</div>
-      <div class="stats-grid">
-        <div class="stat-row"><span>HP</span><span>${hpNow} / ${totalMax}</span></div>
-        <div class="stat-row"><span>Max hit</span><span>${maxHit}</span></div>
-        <div class="stat-row"><span>Attack</span><span>Lv ${lv('attack')}</span></div>
-        <div class="stat-row"><span>Strength</span><span>Lv ${lv('strength')}</span></div>
-        <div class="stat-row"><span>Defense</span><span>Lv ${lv('defense')}</span></div>
-        <div class="stat-row"><span>Gear Atk</span><span>+${gear.attackBonus}</span></div>
-        <div class="stat-row"><span>Gear Str</span><span>+${gear.strengthBonus}</span></div>
-        <div class="stat-row"><span>Gear Def</span><span>+${gear.defenseBonus}</span></div>
+      <div class="stats-title">Combat</div>
+      <div class="stats-grid stats-two-col">
+        <div class="stat-row"><span>Attack</span><span class="stat-val">${lv('attack')}</span></div>
+        <div class="stat-row"><span>Max hit</span><span class="stat-val">${maxHit}</span></div>
+        <div class="stat-row"><span>Strength</span><span class="stat-val">${lv('strength')}</span></div>
+        <div class="stat-row"><span>HP</span><span class="stat-val">${hpNow} / ${totalMax}</span></div>
+        <div class="stat-row"><span>Defense</span><span class="stat-val">${lv('defense')}</span></div>
+        <div class="stat-row"><span>Gear Atk</span><span class="stat-val">+${gear.attackBonus}</span></div>
+        <div class="stat-row"><span>Fishing</span><span class="stat-val">${lv('fishing')}</span></div>
+        <div class="stat-row"><span>Gear Str</span><span class="stat-val">+${gear.strengthBonus}</span></div>
+        <div class="stat-row"><span>Gear HP</span><span class="stat-val">+${gear.maxHp}</span></div>
+        <div class="stat-row"><span>Gear Def</span><span class="stat-val">+${gear.defenseBonus}</span></div>
       </div>
-      <div class="stats-note">Equipped gear only. Bags bottom-right.</div>
+      <div class="stats-note">Max hit uses Strength + gear. Attack raises hit chance. XP levels are on a fast curve.</div>
     `;
   }
 
@@ -448,7 +510,7 @@ export class InventoryUi {
       const slots = bag === 'main' ? inv.mainBag : inv.extraBags[bag]!;
       const title =
         bag === 'main'
-          ? 'Main Bag'
+          ? "Traveler's Bag"
           : getItemDef(inv.bagEquip[bag]?.defId ?? '')?.name ?? `Bag ${Number(bag) + 1}`;
       this.bagPanelsEl.appendChild(this.makeBagPanel(title, bag, slots));
     }
@@ -460,10 +522,10 @@ export class InventoryUi {
     slots: (ItemInstance | null)[],
   ): HTMLElement {
     const panel = document.createElement('div');
-    panel.className = 'wow-bag-panel';
+    panel.className = 'bag-panel' + (bag === 'main' ? ' main-traveler-bag' : '');
 
     const header = document.createElement('div');
-    header.className = 'wow-bag-header';
+    header.className = 'bag-header';
     const titleSpan = document.createElement('span');
     titleSpan.textContent = title;
     const close = document.createElement('button');
@@ -474,17 +536,10 @@ export class InventoryUi {
     header.appendChild(close);
     panel.appendChild(header);
 
-    if (bag === 'main') {
-      const coins = document.createElement('div');
-      coins.className = 'coin-purse';
-      coins.innerHTML = `<span class="coin gold">Gold <b>${this.world.coins.gold}</b></span><span class="coin silver">Silver <b>${this.world.coins.silver}</b></span><span class="coin copper">Copper <b>${this.world.coins.copper}</b></span>`;
-      panel.appendChild(coins);
-    }
-
     if (bag !== 'main') {
       const un = document.createElement('button');
       un.type = 'button';
-      un.className = 'wow-bag-unequip';
+      un.className = 'bag-unequip';
       un.textContent = 'Unequip bag';
       un.dataset.bagUnequip = String(bag);
       panel.appendChild(un);
@@ -501,13 +556,29 @@ export class InventoryUi {
       if (item) {
         const def = getItemDef(item.defId);
         cell.classList.add('filled');
-        cell.style.outlineColor = rarityColor(def?.rarity ?? 'common');
+        const rc = rarityColor(def?.rarity ?? 'common');
+        cell.style.setProperty('--rarity', rc);
+        cell.style.borderColor = rc;
         cell.innerHTML = itemIconHtml(item, { showQty: true });
-        // Custom #inv-tooltip via pointer events — avoid native title (slow / flaky)
       }
       grid.appendChild(cell);
     });
     panel.appendChild(grid);
+
+    // Currency on main traveler bag only (footer, no search)
+    if (bag === 'main') {
+      const coins = this.world.coins;
+      const footer = document.createElement('div');
+      footer.className = 'bag-coin-footer';
+      // Amount then coin: "0 ● 10 ● 50 ●" (no separate total like "10s 50c")
+      footer.innerHTML = `
+        <span class="coin-chip gold" title="Gold"><b>${coins.gold}</b><i></i></span>
+        <span class="coin-chip silver" title="Silver"><b>${coins.silver}</b><i></i></span>
+        <span class="coin-chip copper" title="Copper"><b>${coins.copper}</b><i></i></span>
+      `;
+      panel.appendChild(footer);
+    }
+
     return panel;
   }
 
@@ -605,11 +676,14 @@ export class InventoryUi {
         icon.innerHTML = itemIconHtml(item, { showQty: false });
         btn.classList.add('filled');
         const def = getItemDef(item.defId);
-        btn.style.outlineColor = rarityColor(def?.rarity ?? 'common');
+        const rc = rarityColor(def?.rarity ?? 'common');
+        btn.style.setProperty('--rarity', rc);
+        btn.style.borderColor = rc;
       } else {
         icon.innerHTML = '';
         btn.classList.remove('filled');
-        btn.style.outlineColor = '';
+        btn.style.removeProperty('--rarity');
+        btn.style.borderColor = '';
       }
     });
   }
@@ -618,7 +692,7 @@ export class InventoryUi {
     const hero = this.world.hero();
     const skills = hero?.skills;
     if (!skills) {
-      this.skillsPanelEl.innerHTML = '<p>No hero.</p>';
+      this.skillsPanelEl.innerHTML = '<p class="skills-empty">No hero.</p>';
       return;
     }
     const a = xpProgress(skills.attack);
@@ -628,36 +702,58 @@ export class InventoryUi {
     const fp = `${skills.attack.level}:${a.into}|${skills.strength.level}:${s.into}|${skills.defense.level}:${d.into}|${skills.fishing.level}:${f.into}`;
     if (!force && fp === this.skillsFingerprint) return;
     this.skillsFingerprint = fp;
-    const row = (id: 'attack' | 'strength' | 'defense' | 'fishing', label: string) => {
+
+    const card = (
+      id: 'attack' | 'strength' | 'defense' | 'fishing',
+      label: string,
+      icon: string,
+      blurb: string,
+      accent: string,
+    ) => {
       const sk = skills[id];
       const p = xpProgress(sk);
       const pct = Math.floor(p.pct * 100);
+      const toNext = sk.level >= 99 ? 'Max' : `${p.into} / ${p.need} XP`;
       return `
-        <div class="stat-row"><span>${label}</span><span>Level ${sk.level}</span></div>
-        <div class="xp-bar"><div class="xp-fill" style="width:${pct}%"></div></div>
-        <div class="stat-row subtle"><span>XP</span><span>${p.into} / ${p.need}</span></div>
+        <div class="skill-card" style="--skill-accent:${accent}">
+          <div class="skill-card-icon" aria-hidden="true">${icon}</div>
+          <div class="skill-card-body">
+            <div class="skill-card-top">
+              <span class="skill-card-name">${label}</span>
+              <span class="skill-card-level">Lv ${sk.level}</span>
+            </div>
+            <div class="skill-card-bar" role="progressbar" aria-valuenow="${pct}" aria-valuemin="0" aria-valuemax="100">
+              <div class="skill-card-fill" style="width:${pct}%"></div>
+            </div>
+            <div class="skill-card-meta">
+              <span>${toNext}</span>
+              <span class="skill-card-blurb">${blurb}</span>
+            </div>
+          </div>
+        </div>
       `;
     };
+
     this.skillsPanelEl.innerHTML = `
-      <div class="stats-title">Combat skills</div>
-      <div class="stats-grid">
-        ${row('attack', 'Attack')}
-        ${row('strength', 'Strength')}
-        ${row('defense', 'Defense')}
-      </div>
-      <div class="stats-title" style="margin-top:12px;">Non-Combat skills</div>
-      <div class="stats-grid">
-        ${row('fishing', 'Fishing')}
+      <div class="skills-panel">
+        <div class="skills-section-title">Combat</div>
+        ${card('attack', 'Attack', '⚔', 'Hit chance & weapon reqs', '#f85149')}
+        ${card('strength', 'Strength', '💪', 'Max hit damage', '#e3b341')}
+        ${card('defense', 'Defense', '🛡', 'Mitigation & max HP', '#58a6ff')}
+        <div class="skills-section-title">Gathering</div>
+        ${card('fishing', 'Fishing', '🎣', 'Catch speed at spots', '#79c0ff')}
+        <p class="skills-note">XP curve is tuned for faster levels. Combat: one XP step per successful hit (misses grant nothing).</p>
       </div>
     `;
   }
 
   private showTipForEquip(key: EquipKey, ev: MouseEvent): void {
     const item = this.world.inventory.equipped[key];
-    if (!item) this.tooltipEl.textContent = EQUIP_LABELS[key];
-    else {
+    if (!item) {
+      this.tooltipEl.innerHTML = `<div class="tt-line tt-name">${EQUIP_LABELS[key]}</div>`;
+    } else {
       const hero = this.world.hero();
-      this.tooltipEl.textContent = itemTooltip(item, hero?.skills) + ' · click to unequip';
+      this.tooltipEl.innerHTML = itemTooltipHtml(item, hero?.skills, 'Click to unequip');
     }
     this.tooltipEl.classList.remove('hidden');
     this.positionTip(ev);
@@ -674,7 +770,7 @@ export class InventoryUi {
     const item =
       bagAttr === 'main' ? inv.mainBag[index] : inv.extraBags[Number(bagAttr)]?.[index];
     if (!item) {
-      this.tooltipEl.textContent = 'Empty slot';
+      this.tooltipEl.innerHTML = `<div class="tt-line tt-meta">Empty slot</div>`;
       this.tooltipEl.classList.remove('hidden');
       this.positionTip(ev);
       return;
@@ -682,26 +778,33 @@ export class InventoryUi {
     const def = getItemDef(item.defId);
     const hero = this.world.hero();
     const extra =
-      def?.id === 'raw_fish' ? ' · click to eat' :
-      def?.slot === 'none' ? ' · not equippable' : def?.slot === 'bag' ? ' · click to equip bag' : ' · click to equip';
-    this.tooltipEl.textContent = itemTooltip(item, hero?.skills) + extra;
+      def?.id === 'raw_fish'
+        ? 'Click to eat'
+        : def?.slot === 'none'
+          ? 'Not equippable'
+          : def?.slot === 'bag'
+            ? 'Click to equip bag'
+            : 'Click to equip';
+    this.tooltipEl.innerHTML = itemTooltipHtml(item, hero?.skills, extra);
     this.tooltipEl.classList.remove('hidden');
     this.positionTip(ev);
   }
 
+  /** Place tip below-right of cursor; grow downward (WoW-style). Flip only if clipped. */
   private positionTip(ev: MouseEvent): void {
-    const pad = 12;
-    const tw = this.tooltipEl.offsetWidth || 180;
-    const th = this.tooltipEl.offsetHeight || 40;
+    const pad = 14;
+    const tw = this.tooltipEl.offsetWidth || 200;
+    const th = this.tooltipEl.offsetHeight || 80;
     let left = ev.clientX + pad;
-    let top = ev.clientY + pad;
-    if (left + tw > window.innerWidth - 8) left = ev.clientX - tw - pad;
-    if (top + th > window.innerHeight - 8) top = ev.clientY - th - pad;
+    let top = ev.clientY + pad; // prefer below cursor
+    if (left + tw > window.innerWidth - 8) left = Math.max(4, ev.clientX - tw - pad);
+    if (top + th > window.innerHeight - 8) top = Math.max(4, ev.clientY - th - pad);
     this.tooltipEl.style.left = `${Math.max(4, left)}px`;
     this.tooltipEl.style.top = `${Math.max(4, top)}px`;
   }
 
   private hideTip(): void {
     this.tooltipEl.classList.add('hidden');
+    this.tooltipEl.innerHTML = '';
   }
 }

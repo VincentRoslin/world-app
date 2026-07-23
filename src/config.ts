@@ -1,5 +1,18 @@
+/**
+ * Global tunables for the hybrid isometric game.
+ *
+ * Groups (scan this file when balancing):
+ * - Map / iso projection (chunkSize, tileW/H, entityDrawYOffset)
+ * - Base economy (train costs, upgrades, worker gather rates)
+ * - Resource nodes (capacity 300, replenish, nearby respawn radius)
+ * - Fishing (separate stock + water respawn)
+ * - Hero combat (tick length 0.6s, leash, HP regen)
+ * - Bags / shop range
+ *
+ * Changing saveKey invalidates localStorage saves (use when data shape breaks).
+ */
 export const CONFIG = {
-  /** Tiles per chunk side (was 16; OSRS map squares are 64 — we use 32 for a mid size). */
+  /** Tiles per chunk side (32 balances vision streaming vs content density). */
   chunkSize: 32,
   visionRadius: 8,
   /** Soft cap: how far from home (in chunks) can generate. */
@@ -10,14 +23,24 @@ export const CONFIG = {
   tileH: 28,
   defaultZoom: 0.88,
   /**
-   * Screen-space Y nudge (pre-zoom) so 3D models sit over the tile diamond center.
+   * Screen-space Y nudge for *standing* units (hero, worker, props with height).
    * Positive = toward bottom of screen (iso "south").
+   * IMPORTANT: flat tile-bound art (oat fields, fishing diamonds) must use the
+   * raw tile center (`foot` in Renderer) WITHOUT this offset, or they look shifted.
    */
   entityDrawYOffset: 3,
 
-  /** Soft unit–unit separation (tile units). */
+  /** Soft unit–unit separation (tile units). Kept mild so it doesn’t fight pathing. */
   unitRadius: 0.38,
-  separationStrength: 2.8,
+  separationStrength: 2.4,
+  /**
+   * Max tiles a non-hero can be shoved by separation in one second.
+   * Stops workers from being pushed forever in front of a walking hero —
+   * excess becomes lateral “glide past” motion.
+   */
+  separationMaxSpeed: 1.6,
+  /** Extra lateral bias when a worker is pushed by the hero (0–1). */
+  separationLateralBias: 0.72,
   spawnMinSeparation: 0.55,
 
   startStone: 100,
@@ -41,7 +64,7 @@ export const CONFIG = {
   resourceTickInterval: 15,
   gatherAmount: 3,
   /** How close (tile units) a worker must be to their work slot. */
-  gatherReach: 0.2,
+  gatherReach: 0.28,
   /** When within this of the slot, skip grid path and walk straight in. */
   gatherApproach: 1.5,
   /** How close to deposit point to count as emptying. */
@@ -66,9 +89,18 @@ export const CONFIG = {
     { x: -1, y: -1 },
   ] as const,
 
-  nodeCapacity: 3000,
-  /** Seconds before an empty node refills. */
+  /** Stock per stone / wood / food node before depleting. */
+  nodeCapacity: 300,
+  /** Seconds before an empty node refills (then relocates nearby). */
   nodeReplenishSeconds: 300,
+  /**
+   * Min Chebyshev distance between land resource nodes (centers).
+   * 2 = at least one free tile between nodes so worker stand rings don’t overlap.
+   * Crowding is solved here rather than with complex local avoidance.
+   */
+  nodeMinSeparation: 2,
+  /** Max tiles from a node's anchor when choosing a post-respawn tile. */
+  nodeRespawnRadius: 6,
 
   /** Fishing spots: stock per node and catch timing (game ticks). */
   fishSpotMin: 5,
@@ -79,7 +111,8 @@ export const CONFIG = {
   fishTicksPerLevel: 0.12,
   /** Fastest catch (high level). */
   fishMinTicks: 4,
-  fishXpPerCatch: 18,
+  /** Fishing XP per catch. */
+  fishXpPerCatch: 25,
   /** Seconds before a depleted fishing spot respawns at a nearby water tile. */
   fishRespawnDelay: 120,
   /** Max radius (tiles) from depleted spot to search for a new water tile. */
@@ -96,9 +129,9 @@ export const CONFIG = {
   heroHpRegenPerSec: 1,
   /** Seconds after combat before regen starts. */
   heroCombatGrace: 3,
-  /** OSRS-style game tick length (wiki: 0.6s server cycle). */
+  /** Game tick length (server cycle). */
   gameTickSec: 0.6,
-  /** OSRS walk = 1 tile/tick; run = 2 tiles/tick. */
+  /** Walk = 1 tile/tick; run = 2 tiles/tick. */
   walkTilesPerTick: 1,
   runTilesPerTick: 2,
   /**
@@ -123,6 +156,8 @@ export const CONFIG = {
   maxExtraBags: 4,
   extraBagSlots: 16,
   lootPickupRange: 1.4,
+  /** Hero must be this close (tiles) to open / keep the vendor shop. */
+  shopInteractRange: 2.25,
   /** Normal enemies are mainly a source of materials and pocket change. */
   normalMobGearDropChance: 0.04,
 
@@ -146,7 +181,8 @@ export const CONFIG = {
   wildPackChance: 0.55,
 
   /** Bumped for 32×32 chunks (old 16×16 saves are incompatible). */
-  saveKey: 'iso-base-save-v11',
+  /** Bumped for half-rate XP table + max-hit formula. */
+  saveKey: 'iso-base-save-v12',
 } as const;
 
 /** Per-species starter combat stats (easy). */

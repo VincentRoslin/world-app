@@ -1,4 +1,5 @@
 import { CONFIG } from '../config';
+import { addCoins } from '../core/currency';
 import { dist } from '../core/math';
 import { rollNormalMobDropDefId, rollNormalMobGearDropDefId } from '../items/catalog';
 import { addItem } from './Inventory';
@@ -15,9 +16,11 @@ export function spawnLootAt(world: World, x: number, y: number): void {
         : rollNormalMobDropDefId();
     items.push(world.createItem(defId));
   }
-  // Coins go straight into the purse, so common currency never clutters bags.
-  world.coins.copper += 4 + Math.floor(Math.random() * 9);
-  if (Math.random() < 0.18) world.coins.silver += 1;
+  // Coins go straight into the purse (never bag slots); auto-convert 100c→1s, 100s→1g.
+  addCoins(world.coins, {
+    copper: 4 + Math.floor(Math.random() * 9),
+    silver: Math.random() < 0.18 ? 1 : 0,
+  });
   // Slight offset so piles don't perfectly stack on corpses
   const jx = (Math.random() - 0.5) * 0.3;
   const jy = (Math.random() - 0.5) * 0.3;

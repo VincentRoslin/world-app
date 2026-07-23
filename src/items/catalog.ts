@@ -1,6 +1,6 @@
 import type { ItemDef } from './types';
 
-/** Static item catalog — squished OSRS-style bonuses + skill reqs. */
+/** Static item catalog — combat bonuses + skill requirements. */
 export const ITEM_CATALOG: Record<string, ItemDef> = {
   rusty_sword: {
     id: 'rusty_sword',
@@ -312,6 +312,46 @@ export const ITEM_CATALOG: Record<string, ItemDef> = {
     strengthBonus: 3,
     maxHp: 5,
     requirements: { attack: 20, strength: 20 },
+    rarity: 'rare',
+    dropWeight: 1,
+  },
+
+  wool_cloak: {
+    id: 'wool_cloak',
+    name: 'Wool Cloak',
+    iconColor: '#6e7681',
+    slot: 'cloak',
+    icon: 'cloak',
+    maxStack: 1,
+    defenseBonus: 2,
+    maxHp: 1,
+    rarity: 'common',
+    dropWeight: 8,
+  },
+  travel_cloak: {
+    id: 'travel_cloak',
+    name: 'Travel Cloak',
+    iconColor: '#388bfd',
+    slot: 'cloak',
+    icon: 'cloak',
+    maxStack: 1,
+    defenseBonus: 5,
+    maxHp: 2,
+    requirements: { defense: 10 },
+    rarity: 'uncommon',
+    dropWeight: 4,
+  },
+  night_cape: {
+    id: 'night_cape',
+    name: 'Night Cape',
+    iconColor: '#a371f7',
+    slot: 'cloak',
+    icon: 'cloak',
+    maxStack: 1,
+    defenseBonus: 8,
+    attackBonus: 2,
+    maxHp: 4,
+    requirements: { defense: 20 },
     rarity: 'rare',
     dropWeight: 1,
   },

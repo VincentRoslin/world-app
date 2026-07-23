@@ -2,10 +2,15 @@ export type EntityId = number;
 
 export type ResourceKind = 'stone' | 'wood' | 'food' | 'fish';
 
+/** What the player assigned this worker to do (HUD buttons). */
 export type WorkerJob = 'idle' | 'mine' | 'log' | 'farm' | 'build';
 
-/** Worker resource loop: go to node → gather → return to base → deposit → repeat. */
-export type WorkerPhase = 'idle' | 'toWork' | 'gathering' | 'toBase' | 'building';
+/**
+ * Where the worker is in their current job loop (see Production.updateWorkerCycle).
+ * `waiting` = still has mine/log/farm job but no gatherable node; stands + snores
+ * until a node respawns. Distinct from job `idle` (fully unassigned by player).
+ */
+export type WorkerPhase = 'idle' | 'toWork' | 'gathering' | 'toBase' | 'building' | 'waiting';
 
 export type UnitOrder =
   | { type: 'none' }
@@ -20,7 +25,16 @@ export type UnitOrder =
       pathFromX?: number;
       pathFromY?: number;
     }
-  | { type: 'gather'; nodeId: EntityId; path?: { x: number; y: number }[]; pathGoalX?: number; pathGoalY?: number };
+  | {
+      type: 'gather';
+      nodeId: EntityId;
+      /** Cached approach path; repath when start/goal tiles change (same idea as attack). */
+      path?: { x: number; y: number }[];
+      pathGoalX?: number;
+      pathGoalY?: number;
+      pathFromX?: number;
+      pathFromY?: number;
+    };
 
 export interface FloatText {
   id: number;
@@ -168,6 +182,12 @@ export interface Npc extends BaseEntity {
   name: string;
 }
 
+/**
+ * Harvestable world feature. Land nodes (stone/wood/food) are solid tiles workers
+ * stand *beside*; fish sits on water and is hero-only.
+ * When remaining hits 0, replenishTimer counts down, then the node relocates near
+ * anchor and refills (Production + World.relocateAndRefillNode).
+ */
 export interface ResourceNode extends BaseEntity {
   kind: 'resourceNode';
   resource: ResourceKind;
@@ -175,6 +195,12 @@ export interface ResourceNode extends BaseEntity {
   maxRemaining: number;
   /** >0 while regenerating after depletion (seconds remaining). */
   replenishTimer: number;
+  /**
+   * Frozen "home area" for respawns — search radius is around this point so
+   * nodes don't walk across the whole map over many cycles.
+   */
+  anchorX: number;
+  anchorY: number;
 }
 
 export interface LootPile extends BaseEntity {
@@ -208,7 +234,11 @@ export interface Stockpile {
   food: number;
 }
 
-/** Currency is kept in a wallet and never consumes an inventory slot. */
+/**
+ * Currency wallet (not an inventory slot).
+ * Conversion: 100 copper = 1 silver, 100 silver = 1 gold.
+ * Prefer `normalizeCoins` / `addCoins` from `core/currency` after any mutation.
+ */
 export interface CoinPurse {
   gold: number;
   silver: number;

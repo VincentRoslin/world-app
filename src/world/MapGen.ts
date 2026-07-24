@@ -1,5 +1,5 @@
 import { CONFIG, type EnemySpeciesId } from '../config';
-import type { ResourceKind, Tile } from '../core/types';
+import type { BiomeId, ResourceKind, Tile, TileTerrain } from '../core/types';
 
 // Note: land resource nodes use CONFIG.nodeMinSeparation (Chebyshev) so worker
 // stand tiles around each node stay exclusive — simpler than fancy path dodge.
@@ -51,50 +51,214 @@ function terrainNoise(seed: number, x: number, y: number, scale: number): number
   return top + (bottom - top) * ty;
 }
 
-/** A continuous, gently winding stream that crosses generated chunks. */
-function isStream(seed: number, gx: number, gy: number): boolean {
+// ── Rivers (smooth centerline + orthogonal distance) ─────────────────
+
+/** Winding river centerline Y as a function of X — low frequencies only (less zigzag). */
+function streamCenterY(seed: number, gx: number): number {
   const phase = (seed % 47) - 23;
-  const streamY =
-    42 + phase + Math.sin((gx + seed * 0.13) / 18) * 5 + Math.sin((gx - seed) / 47) * 8;
-  const width = 1.15 + terrainNoise(seed ^ 0x51f15e, gx, gy, 10) * 0.9;
-  return Math.abs(gy + 0.5 - streamY) < width;
+  // Long wavelengths dominate; tiny high-freq terms were making stairsteps
+  return (
+    42 +
+    phase +
+    Math.sin((gx + seed * 0.07) / 36) * 7.5 +
+    Math.sin((gx * 0.9 - seed * 0.2) / 78) * 11 +
+    Math.sin((gx + seed) / 140) * 4
+  );
 }
 
-/** Repeating three-tile crossings keep a stream from splitting the world. */
-function isBridgeCrossing(seed: number, gx: number): boolean {
-  const spacing = 56;
-  const offset = ((seed >>> 5) % spacing) - Math.floor(spacing / 2);
-  const wrapped = ((gx - offset + Math.floor(spacing / 2)) % spacing + spacing) % spacing;
-  return wrapped < 3;
+/**
+ * Approximate distance from tile center to the stream centerline,
+ * accounting for local slope so diagonals don’t stair-step as hard.
+ */
+function streamDist(seed: number, gx: number, gy: number): number {
+  const cy = streamCenterY(seed, gx);
+  const cyL = streamCenterY(seed, gx - 1);
+  const cyR = streamCenterY(seed, gx + 1);
+  const slope = (cyR - cyL) * 0.5; // dy/dx of centerline
+  const dy = gy + 0.5 - cy;
+  // Distance to line with slope: |dy| / sqrt(1+m²)
+  return Math.abs(dy) / Math.sqrt(1 + slope * slope);
 }
 
-function wildTerrain(seed: number, gx: number, gy: number): Tile {
-  if (isStream(seed, gx, gy)) {
-    // Dirt crossing doubles as a simple bridge/path across the narrow stream.
-    if (isBridgeCrossing(seed, gx)) return { terrain: 'dirt', blocked: false };
-    return { terrain: 'water', blocked: true };
+function streamHalfWidth(seed: number, gx: number, gy: number): number {
+  // Slow width variation — avoid per-tile width noise that creates jaggies
+  const w = 1.55 + terrainNoise(seed ^ 0x51f15e, gx * 0.35, gy * 0.35, 14) * 0.85;
+  return w;
+}
+
+function isStreamWater(seed: number, gx: number, gy: number): boolean {
+  return streamDist(seed, gx, gy) < streamHalfWidth(seed, gx, gy);
+}
+
+/**
+ * Bridge: every ~spacing tiles along X, a short dirt span across the river.
+ * Uses river local frame so the crossing is thick enough in Y for wide water.
+ */
+function isBridgeTile(seed: number, gx: number, gy: number): boolean {
+  if (!isStreamWater(seed, gx, gy) && streamDist(seed, gx, gy) > streamHalfWidth(seed, gx, gy) + 0.9) {
+    return false;
   }
-
-  // Dirt forms broad, sparse clearings rather than a checker of random tiles.
-  const clearing = terrainNoise(seed ^ 0x9e3779b9, gx, gy, 12);
-  const terrain: Tile['terrain'] = clearing > 0.69 ? 'dirt' : 'grass';
-  return { terrain, blocked: false, decoration: pickDecoration(seed, gx, gy, terrain) };
+  const spacing = 48;
+  const offset = ((seed >>> 5) % spacing) - Math.floor(spacing / 2);
+  const along = ((gx - offset) % spacing + spacing) % spacing;
+  // 4-tile-wide deck along river length
+  if (along >= 4) return false;
+  // Allow deck + short ramps onto bank (slightly outside pure water)
+  return streamDist(seed, gx, gy) < streamHalfWidth(seed, gx, gy) + 1.1;
 }
 
-/** Sparse scenery provides variety without adding random-looking terrain colors. */
+// ── Biomes ───────────────────────────────────────────────────────────
+
+export function biomeAt(seed: number, gx: number, gy: number): BiomeId {
+  // Large-scale regions so whole chunks feel consistent (no tundra/snow near start)
+  const a = terrainNoise(seed ^ 0xb10b10, gx, gy, 92);
+  const b = terrainNoise(seed ^ 0xf07e57, gx, gy, 64);
+  // Near origin bias to meadow (home-friendly)
+  const dist = Math.hypot(gx / CONFIG.chunkSize, gy / CONFIG.chunkSize);
+  if (dist < 1.35) return 'meadow';
+  if (a > 0.72) return 'arid';
+  if (b > 0.55) return 'forest';
+  return 'meadow';
+}
+
+// ── Dirt paths (soft corridors) ──────────────────────────────────────
+
+function isDirtPath(seed: number, gx: number, gy: number): boolean {
+  // Path follows low-frequency noise ridges + occasional straight lanes
+  const n = terrainNoise(seed ^ 0x0a7a, gx, gy, 26);
+  const ridge = Math.abs(n - 0.5);
+  if (ridge < 0.028) return true;
+  // Cross-paths every so often (straighter dirt tracks)
+  const lane = Math.abs(((gy + Math.floor(seed % 9)) % 29) - 14);
+  if (lane <= 0 && n > 0.35 && n < 0.72) return true;
+  const laneX = Math.abs(((gx + Math.floor(seed % 7)) % 33) - 16);
+  if (laneX <= 0 && n > 0.38 && n < 0.7) return true;
+  return false;
+}
+
+// ── Base tile composition ────────────────────────────────────────────
+
+function landTerrainForBiome(biome: BiomeId, seed: number, gx: number, gy: number): TileTerrain {
+  const clearing = terrainNoise(seed ^ 0x9e3779b9, gx, gy, 14);
+  switch (biome) {
+    case 'arid':
+      return clearing > 0.55 ? 'sand' : 'dirt';
+    case 'forest':
+      return clearing > 0.82 ? 'dirt' : 'grass';
+    case 'meadow':
+    default:
+      return clearing > 0.71 ? 'dirt' : 'grass';
+  }
+}
+
 function pickDecoration(
   seed: number,
   gx: number,
   gy: number,
-  terrain: Tile['terrain'],
+  terrain: TileTerrain,
+  biome: BiomeId,
 ): Tile['decoration'] | undefined {
+  if (terrain === 'water') return undefined;
   const roll = hash01(seed ^ 0x27d4eb2d, gx, gy);
+  const forestBoost = biome === 'forest' ? 0.04 : 0;
+  const aridBoost = biome === 'arid' ? 0.02 : 0;
+
   if (terrain === 'grass') {
-    if (roll > 0.972) return 'tree';
-    if (roll > 0.954) return 'fallenTree';
+    // Non-resource trees / bushes — denser in forest
+    if (roll > 0.965 - forestBoost) return 'tree';
+    if (roll > 0.948 - forestBoost * 0.5) return 'bush';
+    if (roll > 0.935) return 'fallenTree';
   }
-  if (terrain === 'dirt' && roll > 0.978) return 'stone';
+  if (terrain === 'dirt' || terrain === 'sand') {
+    if (roll > 0.97 - aridBoost) return 'rock';
+    if (roll > 0.955 - aridBoost) return 'stone';
+    if (roll > 0.94 && biome === 'forest') return 'bush';
+  }
   return undefined;
+}
+
+function composeTile(seed: number, gx: number, gy: number): Tile {
+  const biome = biomeAt(seed, gx, gy);
+
+  // River + bridges first
+  if (isBridgeTile(seed, gx, gy)) {
+    return { terrain: 'dirt', blocked: false, biome, decoration: undefined };
+  }
+  if (isStreamWater(seed, gx, gy)) {
+    return { terrain: 'water', blocked: true, biome };
+  }
+
+  // Paths over land
+  if (isDirtPath(seed, gx, gy)) {
+    const t: TileTerrain = biome === 'arid' ? 'sand' : 'dirt';
+    return {
+      terrain: t,
+      blocked: false,
+      biome,
+      decoration: pickDecoration(seed, gx, gy, t, biome),
+    };
+  }
+
+  const terrain = landTerrainForBiome(biome, seed, gx, gy);
+  return {
+    terrain,
+    blocked: false,
+    biome,
+    decoration: pickDecoration(seed, gx, gy, terrain, biome),
+  };
+}
+
+/**
+ * Soften water/land edges inside a chunk: fill single-tile bites, trim 1-tile spikes.
+ * Keeps bridges (dirt that was stream) intact.
+ */
+function smoothWaterEdges(
+  tiles: { gx: number; gy: number; tile: Tile }[],
+  seed: number,
+): void {
+  const map = new Map<string, Tile>();
+  for (const t of tiles) map.set(`${t.gx},${t.gy}`, t.tile);
+
+  const isWater = (gx: number, gy: number) => map.get(`${gx},${gy}`)?.terrain === 'water';
+
+  // Two light passes — enough to kill most stairsteps without erasing the river
+  for (let pass = 0; pass < 2; pass++) {
+    const updates: { key: string; toWater: boolean }[] = [];
+    for (const t of tiles) {
+      const { gx, gy, tile } = t;
+      // Never convert bridge dirt back to water
+      if (isBridgeTile(seed, gx, gy)) continue;
+
+      let n = 0;
+      if (isWater(gx + 1, gy)) n++;
+      if (isWater(gx - 1, gy)) n++;
+      if (isWater(gx, gy + 1)) n++;
+      if (isWater(gx, gy - 1)) n++;
+
+      if (tile.terrain === 'water' && n <= 1) {
+        // Lonely / spike water → land
+        updates.push({ key: `${gx},${gy}`, toWater: false });
+      } else if (tile.terrain !== 'water' && !tile.blocked && n >= 3) {
+        // Pocket almost enclosed by water → fill (smoother bank)
+        updates.push({ key: `${gx},${gy}`, toWater: true });
+      }
+    }
+    for (const u of updates) {
+      const tile = map.get(u.key);
+      if (!tile) continue;
+      if (u.toWater) {
+        tile.terrain = 'water';
+        tile.blocked = true;
+        tile.decoration = undefined;
+      } else {
+        const [xs, ys] = u.key.split(',').map(Number) as [number, number];
+        const biome = tile.biome ?? biomeAt(seed, xs, ys);
+        tile.terrain = landTerrainForBiome(biome, seed, xs, ys);
+        tile.blocked = false;
+        tile.decoration = pickDecoration(seed, xs, ys, tile.terrain, biome);
+      }
+    }
+  }
 }
 
 export interface PackMember {
@@ -116,12 +280,8 @@ export interface ChunkContent {
 /**
  * Procedural content for one chunk before World materializes entities/tiles.
  *
- * Home chunk (0,0): safe base, tight resource clusters (stone NW, wood NE, food SE),
- * pond + fishing spots, starter workers — no enemy packs.
- * Wild chunks: noise terrain, streams, random resources, chance of packs.
- *
- * Resource placement note: stone/wood/food use adjacent-ish tiles (like stone's
- * original triangle) so work sites read as clear "camps" for workers.
+ * Home chunk (0,0): safe base, tight resource clusters, pond, workers — no packs.
+ * Wild chunks: biomes, smoother streams + bridges, dirt paths, décor, resources, packs.
  */
 export function generateHomeChunk(worldSeed: number): ChunkContent {
   const size = CONFIG.chunkSize;
@@ -132,16 +292,17 @@ export function generateHomeChunk(worldSeed: number): ChunkContent {
     for (let lx = 0; lx < size; lx++) {
       const gx = ox + lx;
       const gy = oy + ly;
-      const terrain: Tile['terrain'] =
+      let terrain: TileTerrain =
         terrainNoise(worldSeed ^ 0x9e3779b9, gx, gy, 12) > 0.72 ? 'dirt' : 'grass';
+      if (isDirtPath(worldSeed, gx, gy)) terrain = 'dirt';
       tiles.push({
         gx,
         gy,
-        // Home remains dry and walkable, with only a few broad dirt clearings.
         tile: {
           terrain,
           blocked: false,
-          decoration: pickDecoration(worldSeed, gx, gy, terrain),
+          biome: 'meadow',
+          decoration: pickDecoration(worldSeed, gx, gy, terrain, 'meadow'),
         },
       });
     }
@@ -150,7 +311,6 @@ export function generateHomeChunk(worldSeed: number): ChunkContent {
   const baseGx = ox + Math.floor(size / 2) - 1;
   const baseGy = oy + Math.floor(size / 2) - 1;
 
-  // Index for O(1) tile lookup (avoid tiles.find O(N) per place)
   const tileAt = new Map<string, { gx: number; gy: number; tile: Tile }>();
   for (const t of tiles) tileAt.set(`${t.gx},${t.gy}`, t);
 
@@ -172,14 +332,12 @@ export function generateHomeChunk(worldSeed: number): ChunkContent {
     `${baseGx},${baseGy + 1}`,
     `${baseGx + 1},${baseGy + 1}`,
   ]);
-  /** Placed land-node centers (for min separation). */
   const nodeCells: { gx: number; gy: number }[] = [];
   const minSep = CONFIG.nodeMinSeparation;
 
   const farEnough = (gx: number, gy: number): boolean => {
     for (const n of nodeCells) {
-      const cheb = Math.max(Math.abs(n.gx - gx), Math.abs(n.gy - gy));
-      if (cheb < minSep) return false;
+      if (Math.max(Math.abs(n.gx - gx), Math.abs(n.gy - gy)) < minSep) return false;
     }
     return true;
   };
@@ -201,9 +359,6 @@ export function generateHomeChunk(worldSeed: number): ChunkContent {
     resources.push({ x: gx + 0.5, y: gy + 0.5, resource });
   };
 
-  // Home resources: still grouped by region, but ≥ nodeMinSeparation apart so
-  // stand rings (N/E/S/W of each node) don’t share tiles → less worker jams.
-  // Stone NW · Wood NE · Food/oats SE (near pond)
   place('stone', 3, 4);
   place('stone', 3, 7);
   place('stone', 6, 4);
@@ -214,7 +369,6 @@ export function generateHomeChunk(worldSeed: number): ChunkContent {
   place('food', 16, 24);
   place('food', 19, 21);
 
-  // Small fishing pond in the southwest corner (3×3 water + shore)
   const pondTiles: { gx: number; gy: number }[] = [];
   for (let dy = 0; dy < 3; dy++) {
     for (let dx = 0; dx < 3; dx++) {
@@ -233,7 +387,6 @@ export function generateHomeChunk(worldSeed: number): ChunkContent {
     }
   }
 
-  // Fishing spots on water tiles that have a walkable shore neighbor
   const isWalkableHome = (gx: number, gy: number): boolean => {
     const t = tileAt.get(`${gx},${gy}`);
     return !!t && !t.tile.blocked;
@@ -249,13 +402,11 @@ export function generateHomeChunk(worldSeed: number): ChunkContent {
     if (hasShore) fishSpots.push(pt);
   }
 
-  // Place 2 fishing spots on the pond (one is enough for early game)
   for (let i = 0; i < Math.min(2, fishSpots.length); i++) {
     const fs = fishSpots[i]!;
     resources.push({ x: fs.gx + 0.5, y: fs.gy + 0.5, resource: 'fish' });
   }
 
-  // Home square is safe — no mobs in chunk (0,0)
   return {
     tiles,
     resources,
@@ -279,9 +430,11 @@ export function generateWildChunk(worldSeed: number, cx: number, cy: number): Ch
     for (let lx = 0; lx < size; lx++) {
       const gx = ox + lx;
       const gy = oy + ly;
-      tiles.push({ gx, gy, tile: wildTerrain(worldSeed, gx, gy) });
+      tiles.push({ gx, gy, tile: composeTile(worldSeed, gx, gy) });
     }
   }
+
+  smoothWaterEdges(tiles, worldSeed);
 
   const tileAt = new Map<string, { gx: number; gy: number; tile: Tile }>();
   for (const t of tiles) tileAt.set(`${t.gx},${t.gy}`, t);
@@ -290,7 +443,6 @@ export function generateWildChunk(worldSeed: number, cx: number, cy: number): Ch
   const kinds: ResourceKind[] = ['stone', 'wood', 'food'];
   const nodeCells: { gx: number; gy: number }[] = [];
   const minSep = CONFIG.nodeMinSeparation;
-  // ~2.5× the old 16×16 counts (not full 4×) so density stays playable on 32×32
   const resCount = 5 + Math.floor(rand() * 7);
   let attempts = 0;
   while (resources.length < resCount && attempts < resCount * 24) {
@@ -301,7 +453,6 @@ export function generateWildChunk(worldSeed: number, cx: number, cy: number): Ch
     const gy = oy + ly;
     const t = tileAt.get(`${gx},${gy}`);
     if (!t || t.tile.blocked) continue;
-    // Keep land nodes spaced so stand slots don't overlap
     let ok = true;
     for (const n of nodeCells) {
       if (Math.max(Math.abs(n.gx - gx), Math.abs(n.gy - gy)) < minSep) {
@@ -318,7 +469,6 @@ export function generateWildChunk(worldSeed: number, cx: number, cy: number): Ch
     resources.push({ x: gx + 0.5, y: gy + 0.5, resource });
   }
 
-  // Fishing spots on water tiles that have a walkable shore neighbor
   const isWalkableLocal = (map: Map<string, { gx: number; gy: number; tile: Tile }>, gx: number, gy: number): boolean => {
     const t = map.get(`${gx},${gy}`);
     return !!t && !t.tile.blocked;
@@ -342,7 +492,6 @@ export function generateWildChunk(worldSeed: number, cx: number, cy: number): Ch
       const key = `${pick.gx},${pick.gy}`;
       if (usedFish.has(key)) continue;
       usedFish.add(key);
-      // Don't place fish on a tile already claimed as solid resource
       const alreadyResource = resources.some(
         (r) => Math.floor(r.x) === pick.gx && Math.floor(r.y) === pick.gy,
       );
@@ -351,7 +500,6 @@ export function generateWildChunk(worldSeed: number, cx: number, cy: number): Ch
     }
   }
 
-  // Never treat as home; wild only. Scatter packs with 2–4 tile spacing.
   const packs: PackMember[] = [];
   const nearHome = Math.max(Math.abs(cx), Math.abs(cy)) <= 1;
   const chance = nearHome ? CONFIG.wildPackChance * 0.85 : CONFIG.wildPackChance;
@@ -374,7 +522,6 @@ export function generateWildChunk(worldSeed: number, cx: number, cy: number): Ch
         for (let tryN = 0; tryN < 20; tryN++) {
           const ox2 = gx + Math.floor(rand() * 7) - 3;
           const oy2 = gy + Math.floor(rand() * 7) - 3;
-          // Enforce min spacing of 2 tiles between pack members
           if (placed.some((p) => Math.abs(p.x - ox2) + Math.abs(p.y - oy2) < 2)) continue;
           const tt = tileAt.get(`${ox2},${oy2}`);
           if (!tt || tt.tile.blocked) continue;

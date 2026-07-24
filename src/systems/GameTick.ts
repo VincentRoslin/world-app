@@ -1,23 +1,26 @@
 import { CONFIG } from '../config';
 import type { World } from '../world/World';
 import { clearHeroCombat, onGameTickCombat, setHeroCombatTarget } from './Combat';
+import { updateCharacterAnimOnTick } from './CharacterAnim';
 import { clearFishing, startFishing, updateFishingOnTick, updateFishRespawns } from './Fishing';
 import { issueMove } from './Movement';
 import { updateProductionOnTick } from './Production';
 import { updateExploration } from './Exploration';
 import { updateLootPickup } from './Loot';
-import { dist } from '../core/math';
 
 /**
  * Discrete "server" clock for the hybrid game.
  *
  * Architecture (important for learning the codebase):
  * - **Continuous (every frame):** hero/worker movement, camera, rendering.
- * - **Discrete (every CONFIG.gameTickSec ≈ 0.6s):** combat swings, fishing progress,
- *   worker gather ticks, node replenish, train timers.
+ * - **Discrete (every CONFIG.gameTickSec ≈ 0.6s):**
+ *     combat weapon wind-ups / swings, hero stepped animation frames,
+ *     fishing progress, worker gather & food upkeep, node replenish,
+ *     train / build / upgrade timers, exploration, loot.
+ *   (There is no separate craft clock yet — blacksmith is build-time only.)
  *
  * Why both? Movement feels smooth; combat/economy stay readable and fair (no
- * frame-rate-dependent DPS). Player RMB intents are *queued* and applied at the
+ * frame-rate-dependent DPS). Player intents are *queued* and applied at the
  * start of the next tick so order of resolution is deterministic.
  *
  * Called from Game.ts each frame:
@@ -62,6 +65,8 @@ export function tickAlpha(world: World): number {
 export function processGameTick(world: World): void {
   applyPlayerIntents(world);
   onGameTickCombat(world);
+  // After combat so attack contact frames are set before walk would overwrite
+  updateCharacterAnimOnTick(world);
   updateFishingOnTick(world);
   updateFishRespawns(world);
   updateProductionOnTick(world);
@@ -110,17 +115,11 @@ function applyPlayerIntents(world: World): void {
     if (!hero || !hero.alive) return;
     world.selectedId = hero.id;
     clearFishing(hero);
-    // Soft kite: if still inside the enemy camp leash, walk without ending combat.
-    // Leaving the leash (or no valid front) fully clears the fight.
+    // Soft kite: walk freely while combat-engaged. Leash break is owned by
+    // enemy AI (NPC pulled past spawn boundary → walk home), not by player move.
     if (hero.combatEngaged && hero.combatTargetId != null) {
       const front = world.get(hero.combatTargetId);
-      if (
-        front &&
-        front.kind === 'enemy' &&
-        front.alive &&
-        dist(hero.x, hero.y, front.campX, front.campY) <= CONFIG.enemyLeashDistance &&
-        dist(front.x, front.y, front.campX, front.campY) <= CONFIG.enemyLeashDistance
-      ) {
+      if (front && front.kind === 'enemy' && front.alive && !front.leashing) {
         issueMove(world, hero, move.x, move.y);
         hero.combatStandX = null;
         hero.combatStandY = null;

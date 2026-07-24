@@ -1,14 +1,80 @@
 import { CONFIG } from '../config';
-import type { WorkerJob } from '../core/types';
+import type { Worker, WorkerJob, WorkerPhase } from '../core/types';
 import type { World } from '../world/World';
 import { setJobCommand, trainWorkerCommand } from '../systems/Commands';
-import { addBaseUpgradeBuilder, addClosestBuilder, beginBlacksmithPlacement, canTrainWorker, canUpgradeBase, startBaseUpgrade } from '../systems/Production';
+import {
+  addBaseUpgradeBuilder,
+  addClosestBuilder,
+  baseUpgradeCost,
+  beginBlacksmithPlacement,
+  canTrainWorker,
+  canUpgradeBase,
+  maxWorkersAllowed,
+  startBaseUpgrade,
+  workerTrainCost,
+} from '../systems/Production';
+
+/** Job button labels + native title tooltips (what the work does). */
+const JOB_UI: Record<
+  WorkerJob,
+  { label: string; title: string }
+> = {
+  idle: {
+    label: 'Idle',
+    title: 'Unassign this worker. No job, no food upkeep. Free to reassign later.',
+  },
+  mine: {
+    label: 'Mine',
+    title:
+      'Gather stone from deposits and haul it to the base. Uses food while working. Used for training workers and base upgrades.',
+  },
+  log: {
+    label: 'Log',
+    title:
+      'Gather wood from forests and haul it to the base. Uses food while working. Used for base upgrades and future building/crafting.',
+  },
+  farm: {
+    label: 'Farm',
+    title:
+      'Gather food from oat fields and haul it to the base. Uses food while working, but is the main way to restock the larder — other jobs pause when food runs out.',
+  },
+  build: {
+    label: 'Build',
+    title: 'Help construct buildings or base upgrades. Uses food while working.',
+  },
+};
+
+function workerPhaseShort(phase: WorkerPhase, w: Worker): string {
+  if (phase === 'toWork') return 'To work';
+  if (phase === 'gathering') return 'Gathering';
+  if (phase === 'toBase') return w.carried > 0 ? `Haul ${w.carried}` : 'To base';
+  if (phase === 'building') return 'Building';
+  if (phase === 'waiting') return 'Waiting…';
+  if (phase === 'starving') return 'No food';
+  return 'Idle';
+}
+
+function workerPhaseDetail(w: Worker): string {
+  if (w.phase === 'toWork')
+    return `Walking to work${w.slotIndex >= 0 ? ` (slot ${w.slotIndex + 1})` : ''}`;
+  if (w.phase === 'gathering')
+    return `Gathering ${w.gatherTimer.toFixed(1)}s / ${CONFIG.resourceTickInterval}s · slot ${w.slotIndex + 1}`;
+  if (w.phase === 'toBase')
+    return `Returning to base${w.carried > 0 ? ` (carrying ${w.carried} ${w.carriedResource ?? ''})` : ''}`;
+  if (w.phase === 'building') {
+    return 'Constructing / upgrading';
+  }
+  if (w.phase === 'waiting') return 'Waiting for resources… zzz';
+  if (w.phase === 'starving') return 'No food — paused… zzz';
+  return 'Standing by (no job · no food cost)';
+}
 
 export class Hud {
   private world: World;
   private onRestart: () => void;
   private onSave: () => void;
   private onLoad: () => void;
+  private onDevCam?: () => boolean;
   private stoneEl = el('stone');
   private woodEl = el('wood');
   private foodEl = el('food');
@@ -16,6 +82,7 @@ export class Hud {
   private woodIncomeEl = el('wood-income');
   private foodIncomeEl = el('food-income');
   private exploreEl = el('explore-status');
+  private combatLockEl = el('combat-lock');
   private titleEl = el('selection-title');
   private detailEl = el('selection-detail');
   private actionsEl = el('selection-actions');
@@ -25,14 +92,25 @@ export class Hud {
   private overlayMsg = el('overlay-msg');
   private btnPause = document.getElementById('btn-pause') as HTMLButtonElement;
   private pauseOverlay = document.getElementById('pause-overlay')!;
+  private rosterCountEl = el('worker-roster-count');
+  private rosterSummaryEl = el('worker-roster-summary');
+  private rosterListEl = el('worker-roster-list');
   private panelKey = '';
+  private rosterKey = '';
   private buildTabWorkerId: number | null = null;
 
-  constructor(world: World, onRestart: () => void, onSave: () => void, onLoad: () => void) {
+  constructor(
+    world: World,
+    onRestart: () => void,
+    onSave: () => void,
+    onLoad: () => void,
+    onDevCam?: () => boolean,
+  ) {
     this.world = world;
     this.onRestart = onRestart;
     this.onSave = onSave;
     this.onLoad = onLoad;
+    this.onDevCam = onDevCam;
 
     this.btnPause.addEventListener('click', () => {
       this.world.paused = !this.world.paused;
@@ -41,6 +119,26 @@ export class Hud {
     document.getElementById('btn-save')!.addEventListener('click', () => this.onSave());
     document.getElementById('btn-load')!.addEventListener('click', () => this.onLoad());
     document.getElementById('btn-restart')!.addEventListener('click', () => this.onRestart());
+    const devCam = document.getElementById('btn-dev-cam') as HTMLButtonElement | null;
+    if (devCam && this.onDevCam) {
+      devCam.addEventListener('click', () => {
+        const on = this.onDevCam!();
+        devCam.classList.toggle('dev-on', on);
+        devCam.title = on
+          ? 'Dev cam ON — click to restore camera leash'
+          : 'Dev: unlock camera leash (temporary)';
+      });
+    }
+
+    this.rosterListEl.addEventListener('click', (ev) => {
+      const row = (ev.target as HTMLElement).closest('[data-select-worker]') as HTMLElement | null;
+      if (!row) return;
+      const id = Number(row.dataset.selectWorker);
+      if (Number.isNaN(id)) return;
+      this.world.selectedId = id;
+      this.buildTabWorkerId = null;
+      this.panelKey = '';
+    });
 
     this.actionsEl.addEventListener('click', (ev) => {
       const target = (ev.target as HTMLElement).closest(
@@ -103,10 +201,21 @@ export class Hud {
     this.setIncome(this.woodIncomeEl, w.expectedIncome.wood);
     this.setIncome(this.foodIncomeEl, w.expectedIncome.food);
 
-    const explored = w.explored.size;
     const loaded = w.tiles.size;
-    this.exploreEl.textContent = `Explored ${explored} · Chunks ${w.loadedChunks.size} · Map ${loaded} tiles`;
+    this.exploreEl.textContent = `Chunks ${w.loadedChunks.size} · Map ${loaded} tiles`;
 
+    const hero = w.hero();
+    const lock = hero && hero.alive ? hero.combatLockTicks : 0;
+    if (lock > 0) {
+      this.combatLockEl.classList.remove('hidden');
+      this.combatLockEl.textContent = `Combat ${lock}`;
+      this.combatLockEl.title = `Combat lock — ${lock} ticks left (logout blocked until 0)`;
+    } else {
+      this.combatLockEl.classList.add('hidden');
+      this.combatLockEl.textContent = 'Combat —';
+    }
+
+    this.renderWorkerRoster();
     this.renderSelection();
     this.syncPauseUi();
 
@@ -128,8 +237,80 @@ export class Hud {
   }
 
   private setIncome(node: HTMLElement, amount: number): void {
-    node.textContent = `+${Math.floor(amount)}`;
-    node.classList.toggle('zero', amount <= 0);
+    const n = Math.floor(amount);
+    // Food can go negative once upkeep > farm output
+    node.textContent = n > 0 ? `+${n}` : n < 0 ? `${n}` : '+0';
+    node.classList.toggle('zero', n === 0);
+    node.classList.toggle('neg', n < 0);
+  }
+
+  /** Left roster: totals, job breakdown, per-worker status (click to select). */
+  private renderWorkerRoster(): void {
+    const workers: Worker[] = [];
+    for (const e of this.world.entities.values()) {
+      if (e.alive && e.kind === 'worker') workers.push(e);
+    }
+
+    const cap = maxWorkersAllowed(this.world);
+    const counts: Record<WorkerJob, number> = {
+      idle: 0,
+      mine: 0,
+      log: 0,
+      farm: 0,
+      build: 0,
+    };
+    for (const w of workers) counts[w.job] += 1;
+
+    workers.sort((a, b) => a.rosterNo - b.rosterNo || a.id - b.id);
+
+    const key =
+      `${workers.length}/${cap}|` +
+      workers
+        .map(
+          (w) =>
+            `${w.id}:${w.rosterNo}:${w.job}:${w.phase}:${w.carried}:${this.world.selectedId === w.id ? 1 : 0}`,
+        )
+        .join(',');
+    if (key === this.rosterKey) return;
+    this.rosterKey = key;
+
+    this.rosterCountEl.textContent = `${workers.length}/${cap}`;
+    this.rosterCountEl.title = `Living workers / cap (cap rises when you upgrade the base)`;
+
+    const chips: { job: WorkerJob; label: string }[] = [
+      { job: 'idle', label: 'Idle' },
+      { job: 'mine', label: 'Mine' },
+      { job: 'log', label: 'Log' },
+      { job: 'farm', label: 'Farm' },
+      { job: 'build', label: 'Build' },
+    ];
+    this.rosterSummaryEl.innerHTML = chips
+      .filter((c) => counts[c.job] > 0 || c.job === 'idle')
+      .map(
+        (c) =>
+          `<span class="worker-sum-chip ${c.job}" title="${JOB_UI[c.job].title}"><i></i>${c.label} ${counts[c.job]}</span>`,
+      )
+      .join('');
+
+    if (workers.length === 0) {
+      this.rosterListEl.innerHTML = `<div class="worker-roster-empty">No workers yet — train some at the Base.</div>`;
+      return;
+    }
+
+    this.rosterListEl.innerHTML = workers
+      .map((w) => {
+        const selected = this.world.selectedId === w.id ? ' selected' : '';
+        const phaseClass =
+          w.phase === 'starving' ? ' starving' : w.phase === 'waiting' ? ' waiting' : '';
+        const phase = workerPhaseShort(w.phase, w);
+        const tip = `Worker #${w.rosterNo} · ${w.job} · ${workerPhaseDetail(w)}`;
+        return `<button type="button" class="worker-roster-row${selected}${phaseClass}" data-select-worker="${w.id}" title="${tip}">
+          <span class="wr-id">#${w.rosterNo}</span>
+          <span class="wr-job ${w.job}">${w.job}</span>
+          <span class="wr-phase">${phase}</span>
+        </button>`;
+      })
+      .join('');
   }
 
   private renderSelection(): void {
@@ -151,7 +332,7 @@ export class Hud {
     if (!e || !e.alive) {
       this.panelEl.classList.remove('hero-selected');
       this.titleEl.textContent = 'Nothing selected';
-      this.detailEl.textContent = 'Click the hero, a worker, or your base.';
+      this.detailEl.textContent = 'LMB select · LMB ground to move · RMB attack / shop / fish.';
       if (this.panelKey !== key) {
         this.actionsEl.innerHTML = '';
         this.panelKey = key;
@@ -191,35 +372,29 @@ export class Hud {
         }
         return;
       }
-      this.titleEl.textContent = `Worker (${e.job})`;
-      const phaseLabel =
-        e.phase === 'toWork'
-          ? `Walking to work${e.slotIndex >= 0 ? ` (slot ${e.slotIndex + 1})` : ''}`
-          : e.phase === 'gathering'
-            ? `Gathering ${e.gatherTimer.toFixed(1)}s / ${CONFIG.resourceTickInterval}s · slot ${e.slotIndex + 1}`
-            : e.phase === 'toBase'
-              ? `Returning to base${e.carried > 0 ? ` (carrying ${e.carried})` : ''}`
-              : e.phase === 'building'
-                ? (e.constructionId != null && this.world.get(e.constructionId)?.kind === 'base' ? 'Upgrading base' : 'Constructing building')
-                : e.phase === 'waiting'
-                  ? 'Waiting for resources… zzz'
-                  : 'Idle near base';
-      this.detailEl.textContent = `HP ${Math.ceil(e.hp)}/${e.maxHp} · ${phaseLabel}`;
-      const actionKey = `worker-btns:${e.id}:${e.job}:${e.phase}`;
+      this.titleEl.textContent = `Worker #${e.rosterNo} · ${e.job}`;
+      this.detailEl.textContent = `HP ${Math.ceil(e.hp)}/${e.maxHp} · ${workerPhaseDetail(e)}`;
+      const actionKey = `worker-btns:${e.id}:${e.rosterNo}:${e.job}:${e.phase}`;
       if (this.panelKey !== actionKey) {
         this.actionsEl.innerHTML = '';
         for (const job of ['idle', 'mine', 'log', 'farm'] as const) {
+          const meta = JOB_UI[job];
           const b = document.createElement('button');
           b.type = 'button';
           b.dataset.action = 'job';
           b.dataset.job = job;
-          b.textContent = job[0]!.toUpperCase() + job.slice(1);
+          b.textContent = meta.label;
+          b.title = meta.title;
           if (e.job === job) b.classList.add('primary');
           this.actionsEl.appendChild(b);
         }
         const build = document.createElement('button');
-        build.type = 'button'; build.dataset.action = 'build'; build.dataset.workerId = String(e.id);
+        build.type = 'button';
+        build.dataset.action = 'build';
+        build.dataset.workerId = String(e.id);
         build.textContent = 'Build';
+        build.title =
+          'Open the build menu — place a Blacksmith (needs Base level 1+) or assign construction work. Uses food while building.';
         this.actionsEl.appendChild(build);
         this.panelKey = actionKey;
       }
@@ -230,25 +405,34 @@ export class Hud {
       const queue = e.trainQueue > 0 ? ` · Training ${e.trainQueue} (${e.trainTimer.toFixed(1)}s)` : '';
       const upgradeLabel = e.upgrading
         ? ` · Upgrading Lv${e.upgradeLevel + 1} (${Math.floor((e.upgradeProgress / e.upgradeSeconds) * 100)}%)`
-        : e.upgradeLevel > 0 ? ` · Level ${e.upgradeLevel}` : '';
+        : e.upgradeLevel > 0
+          ? ` · Level ${e.upgradeLevel}`
+          : '';
+      const cap = maxWorkersAllowed(this.world);
+      const trainCost = workerTrainCost(this.world);
+      const upCost = baseUpgradeCost(this.world);
       this.titleEl.textContent = 'Base (Home)';
-      this.detailEl.textContent = `HP ${Math.ceil(e.hp)}/${e.maxHp} · Workers ${this.world.workerCount()}/${CONFIG.maxWorkers}${queue}${upgradeLabel}`;
-      const baseKey = `base:${e.id}:${e.trainQueue}:${canTrainWorker(this.world) ? 1 : 0}:${Math.floor(e.trainTimer)}:${e.upgradeLevel}:${e.upgrading}:${Math.floor(e.upgradeProgress)}:${e.upgradeBuilderIds.length}`;
+      this.detailEl.textContent = `HP ${Math.ceil(e.hp)}/${e.maxHp} · Workers ${this.world.workerCount()}/${cap}${queue}${upgradeLabel}`;
+      const baseKey = `base:${e.id}:${e.trainQueue}:${canTrainWorker(this.world) ? 1 : 0}:${Math.floor(e.trainTimer)}:${e.upgradeLevel}:${e.upgrading}:${Math.floor(e.upgradeProgress)}:${e.upgradeBuilderIds.length}:${cap}:${trainCost.stone}:${trainCost.food}:${upCost.stone}`;
       if (this.panelKey !== baseKey) {
         this.actionsEl.innerHTML = '';
         const train = document.createElement('button');
         train.type = 'button';
         train.className = 'primary';
         train.dataset.action = 'train';
-        train.textContent = `Train Worker (${CONFIG.workerTrainStone}s + ${CONFIG.workerTrainFood}f)`;
+        train.textContent = `Train Worker (${trainCost.stone}s + ${trainCost.food}f)`;
+        train.title = `Scales with workforce · cap ${cap} (upgrade base for more)`;
         train.disabled = !canTrainWorker(this.world);
         this.actionsEl.appendChild(train);
 
         if (e.upgradeLevel < CONFIG.baseMaxLevel) {
           if (e.upgrading) {
-            const eta = Math.ceil((e.upgradeSeconds - e.upgradeProgress) / Math.max(1, e.upgradeBuilderIds.length));
+            const eta = Math.ceil(
+              (e.upgradeSeconds - e.upgradeProgress) / Math.max(1, e.upgradeBuilderIds.length),
+            );
             const addBuilder = document.createElement('button');
-            addBuilder.type = 'button'; addBuilder.className = 'primary';
+            addBuilder.type = 'button';
+            addBuilder.className = 'primary';
             addBuilder.dataset.action = 'add-base-builder';
             addBuilder.textContent = `Add Idle Worker (${e.upgradeBuilderIds.length} building · ~${eta}s)`;
             this.actionsEl.appendChild(addBuilder);
@@ -256,7 +440,8 @@ export class Hud {
             const upgrade = document.createElement('button');
             upgrade.type = 'button';
             upgrade.dataset.action = 'upgrade-base';
-            upgrade.textContent = `Upgrade Base (${CONFIG.baseUpgradeStone}s + ${CONFIG.baseUpgradeWood}w + ${CONFIG.baseUpgradeFood}f)`;
+            upgrade.textContent = `Upgrade Base (${upCost.stone}s + ${upCost.wood}w + ${upCost.food}f)`;
+            upgrade.title = `→ Level ${e.upgradeLevel + 1} · raises worker cap to ${Math.min(CONFIG.maxWorkers, CONFIG.maxWorkersBase + (e.upgradeLevel + 1) * CONFIG.maxWorkersPerBaseLevel)}`;
             upgrade.disabled = !canUpgradeBase(this.world);
             this.actionsEl.appendChild(upgrade);
           }

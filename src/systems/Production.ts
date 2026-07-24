@@ -2,19 +2,23 @@
  * Village economy: workers, resource gather loop, buildings, node respawns.
  *
  * Worker mental model (phase state machine):
- *   idle      — player unassigned; stands freely
+ *   idle      — player unassigned; stands freely (no food upkeep)
  *   toWork    — pathing to a stand slot beside a resource node
  *   gathering — timer accumulates; every resourceTickInterval seconds take gatherAmount
  *   toBase    — haul cargo to the base ring and deposit into stockpile
- *   waiting   — job still mine/log/farm but every node of that type is empty;
- *               stand still and snore (Renderer draws zzZ) until one refills
+ *   waiting   — job set, no gatherable node; snore until respawn
+ *   starving  — job set, stockpile food empty; snore until food returns (Stage 1)
  *   building  — blacksmith / base upgrade construction
+ *
+ * Stage 1 food upkeep:
+ *   - Any worker with job !== idle burns food on a timer.
+ *   - At 0 food they pause (keep job) instead of producing forever AFK.
+ *   - ~1 farmer supports ~3 working workers at current gather/upkeep rates.
  *
  * Resource nodes (stone/wood/food):
  *   - Cap at CONFIG.nodeCapacity (300). When empty → replenishTimer runs.
- *   - On timer end: World.relocateAndRefillNode moves the node near its anchor
- *     so the map stays lively without nodes drifting across the world.
- *   - Fish uses a separate pendingFishRespawns path in Fishing.ts.
+ *   - On timer end: World.relocateAndRefillNode moves the node near its anchor.
+ *   - Fish uses pendingFishRespawns in Fishing.ts.
  *
  * Workers only gather on the home chunk (World.findWorkNode filters isHomeTile).
  */
@@ -25,12 +29,51 @@ import type { BaseBuilding, BlacksmithBuilding, ResourceKind, ResourceNode, Stoc
 import type { World } from '../world/World';
 import { issueGather, issueMove } from './Movement';
 
-export function canTrainWorker(world: World): boolean {
-  if (world.workerCount() + (world.base()?.trainQueue ?? 0) >= CONFIG.maxWorkers) return false;
-  return (
-    world.stockpile.stone >= CONFIG.workerTrainStone &&
-    world.stockpile.food >= CONFIG.workerTrainFood
+/** Max workers allowed at current base level (grows with upgrades). */
+export function maxWorkersAllowed(world: World): number {
+  const lv = world.base()?.upgradeLevel ?? 0;
+  return Math.min(
+    CONFIG.maxWorkers,
+    CONFIG.maxWorkersBase + lv * CONFIG.maxWorkersPerBaseLevel,
   );
+}
+
+/** Workers alive + currently queued for training. */
+export function workforceHeadcount(world: World): number {
+  return world.workerCount() + (world.base()?.trainQueue ?? 0);
+}
+
+/**
+ * Stage 2 — train cost scales with existing workforce.
+ * cost = base * (1 + scale * headcount)
+ */
+export function workerTrainCost(world: World): { stone: number; food: number } {
+  const n = workforceHeadcount(world);
+  const mult = 1 + CONFIG.workerTrainScalePerWorker * n;
+  return {
+    stone: Math.ceil(CONFIG.workerTrainStone * mult),
+    food: Math.ceil(CONFIG.workerTrainFood * mult),
+  };
+}
+
+/**
+ * Stage 2 — upgrade cost for going from current level → next.
+ * cost = base * (1 + scale * currentLevel)
+ */
+export function baseUpgradeCost(world: World): { stone: number; wood: number; food: number } {
+  const lv = world.base()?.upgradeLevel ?? 0;
+  const mult = 1 + CONFIG.baseUpgradeScalePerLevel * lv;
+  return {
+    stone: Math.ceil(CONFIG.baseUpgradeStone * mult),
+    wood: Math.ceil(CONFIG.baseUpgradeWood * mult),
+    food: Math.ceil(CONFIG.baseUpgradeFood * mult),
+  };
+}
+
+export function canTrainWorker(world: World): boolean {
+  if (workforceHeadcount(world) >= maxWorkersAllowed(world)) return false;
+  const cost = workerTrainCost(world);
+  return world.stockpile.stone >= cost.stone && world.stockpile.food >= cost.food;
 }
 
 export function canUpgradeBase(world: World): boolean {
@@ -38,10 +81,11 @@ export function canUpgradeBase(world: World): boolean {
   if (!base || !base.alive) return false;
   if (base.upgradeLevel >= CONFIG.baseMaxLevel) return false;
   if (base.upgrading) return false;
+  const cost = baseUpgradeCost(world);
   return (
-    world.stockpile.stone >= CONFIG.baseUpgradeStone &&
-    world.stockpile.wood >= CONFIG.baseUpgradeWood &&
-    world.stockpile.food >= CONFIG.baseUpgradeFood
+    world.stockpile.stone >= cost.stone &&
+    world.stockpile.wood >= cost.wood &&
+    world.stockpile.food >= cost.food
   );
 }
 
@@ -49,14 +93,15 @@ export function startBaseUpgrade(world: World): boolean {
   const base = world.base();
   if (!base || !base.alive) return false;
   if (!canUpgradeBase(world)) return false;
-  world.stockpile.stone -= CONFIG.baseUpgradeStone;
-  world.stockpile.wood -= CONFIG.baseUpgradeWood;
-  world.stockpile.food -= CONFIG.baseUpgradeFood;
+  const cost = baseUpgradeCost(world);
+  world.stockpile.stone -= cost.stone;
+  world.stockpile.wood -= cost.wood;
+  world.stockpile.food -= cost.food;
   base.upgrading = true;
   base.upgradeProgress = 0;
   base.upgradeSeconds = CONFIG.baseUpgradeSeconds;
   base.upgradeBuilderIds = [];
-  world.message = 'Base upgrade started.';
+  world.message = `Base upgrade to level ${base.upgradeLevel + 1} started.`;
   return true;
 }
 
@@ -89,10 +134,12 @@ export function queueTrainWorker(world: World): boolean {
   const base = world.base();
   if (!base || !base.alive) return false;
   if (!canTrainWorker(world)) return false;
-  world.stockpile.stone -= CONFIG.workerTrainStone;
-  world.stockpile.food -= CONFIG.workerTrainFood;
+  const cost = workerTrainCost(world);
+  world.stockpile.stone -= cost.stone;
+  world.stockpile.food -= cost.food;
   base.trainQueue += 1;
   if (base.trainTimer <= 0) base.trainTimer = CONFIG.workerTrainTime;
+  world.message = `Training worker (${cost.stone} stone, ${cost.food} food).`;
   return true;
 }
 
@@ -122,6 +169,12 @@ export function assignWorkerJob(world: World, worker: Worker, job: WorkerJob): b
   const resource = world.resourceForJob(job);
   if (!resource) return false;
 
+  if (world.stockpile.food <= 0) {
+    world.message = 'No food — assign Farm first, or wait for a delivery.';
+    enterStarving(world, worker);
+    return true;
+  }
+
   const found = world.findWorkNode(worker.x, worker.y, resource);
   if (!found) {
     // Keep the job so they auto-resume when a node refills (snore UI).
@@ -138,11 +191,11 @@ export function assignWorkerJob(world: World, worker: Worker, job: WorkerJob): b
 }
 
 /**
- * One production tick: refill timers → train workers → each worker state machine
- * → construction / base upgrade progress → recompute expected income for HUD.
+ * One production tick: food upkeep → refill timers → train → workers → build → HUD income.
  */
 export function updateProductionOnTick(world: World): void {
   const dt = CONFIG.gameTickSec;
+  updateFoodUpkeep(world, dt);
   updateNodeReplenish(world, dt);
 
   const base = world.base();
@@ -242,6 +295,8 @@ function updateConstruction(world: World, dt: number): void {
     for (const id of e.builderIds) {
       const worker = world.get(id);
       if (!worker || worker.kind !== 'worker') continue;
+      // Starving builders keep their assignment but don't progress the build
+      if (worker.phase === 'starving') continue;
       const stand = world.constructionStand(e, worker.id);
       if (!stand) continue;
       if (dist(worker.x, worker.y, stand.x, stand.y) <= 0.5) {
@@ -276,6 +331,7 @@ function updateBaseUpgrade(world: World, dt: number): void {
   for (const id of base.upgradeBuilderIds) {
     const worker = world.get(id);
     if (!worker || worker.kind !== 'worker') continue;
+    if (worker.phase === 'starving') continue;
     const origin = world.baseFootprintOrigin();
     if (!origin) continue;
     const stand = world.constructionStandForBase(origin.gx, origin.gy, base.upgradeBuilderIds.indexOf(id));
@@ -340,6 +396,93 @@ function enterWaiting(worker: Worker): void {
   worker.order = { type: 'none' };
 }
 
+/**
+ * Stage 1: job stays assigned; stop working until stockpile has food again.
+ * Haulers mid-trip still deliver cargo first so food isn't stranded on them.
+ */
+function enterStarving(world: World, worker: Worker): void {
+  if (worker.carried > 0 && worker.carriedResource) {
+    clearWorkClaim(worker);
+    worker.gatherTimer = 0;
+    worker.phase = 'toBase';
+    sendToBase(world, worker);
+    return;
+  }
+  if (worker.job !== 'build') clearWorkClaim(worker);
+  worker.phase = 'starving';
+  worker.gatherTimer = 0;
+  worker.order = { type: 'none' };
+}
+
+/**
+ * Charge food for every worker with a job. Idle workers are free.
+ * When the larder is empty, working workers pause (starving) until food returns.
+ */
+function updateFoodUpkeep(world: World, dt: number): void {
+  let announced = false;
+  for (const e of world.entities.values()) {
+    if (!e.alive || e.kind !== 'worker') continue;
+    const worker = e;
+
+    if (worker.job === 'idle') {
+      worker.foodUpkeepAcc = 0;
+      continue;
+    }
+
+    if (worker.phase === 'starving') {
+      if (world.stockpile.food > 0) resumeFromStarving(world, worker);
+      continue;
+    }
+
+    worker.foodUpkeepAcc += dt;
+    while (worker.foodUpkeepAcc >= CONFIG.workerFoodUpkeepInterval) {
+      worker.foodUpkeepAcc -= CONFIG.workerFoodUpkeepInterval;
+      const cost = CONFIG.workerFoodUpkeepAmount;
+      if (world.stockpile.food >= cost) {
+        world.stockpile.food -= cost;
+      } else {
+        world.stockpile.food = 0;
+        enterStarving(world, worker);
+        if (!announced) {
+          world.message = 'No food — workers pause until the farm delivers.';
+          announced = true;
+        }
+        break;
+      }
+    }
+  }
+}
+
+function resumeFromStarving(world: World, worker: Worker): void {
+  if (worker.job === 'build') {
+    worker.phase = 'building';
+    worker.order = { type: 'none' };
+    const building = worker.constructionId != null ? world.get(worker.constructionId) : null;
+    if (building && building.kind === 'blacksmith' && !building.completed) {
+      const stand = world.constructionStand(building, worker.id);
+      if (stand) issueMove(world, worker, stand.x, stand.y);
+    } else if (building && building.kind === 'base' && building.upgrading) {
+      const origin = world.baseFootprintOrigin();
+      if (origin) {
+        const stand = world.constructionStandForBase(
+          origin.gx,
+          origin.gy,
+          building.upgradeBuilderIds.indexOf(worker.id),
+        );
+        if (stand) issueMove(world, worker, stand.x, stand.y);
+      }
+    }
+    return;
+  }
+
+  const resource = world.resourceForJob(worker.job);
+  if (!resource) {
+    sendIdleNearBase(world, worker);
+    return;
+  }
+  reassignOrIdle(world, worker, resource, null);
+}
+
 /** Fully unassign and park near the base (player-idle / no valid job). */
 function sendIdleNearBase(world: World, worker: Worker): void {
   worker.job = 'idle';
@@ -362,6 +505,10 @@ function reassignOrIdle(world: World, worker: Worker, resource: ResourceKind, ex
     return;
   }
   clearWorkClaim(worker);
+  if (world.stockpile.food <= 0) {
+    enterStarving(world, worker);
+    return;
+  }
   const found = world.findWorkNode(worker.x, worker.y, resource, excludeId);
   if (!found) {
     enterWaiting(worker);
@@ -387,6 +534,13 @@ function updateWorkerCycle(world: World, worker: Worker, dt: number): void {
     return;
   }
 
+  // Starving is handled in updateFoodUpkeep (resume when food > 0)
+  if (worker.phase === 'starving') {
+    worker.order = { type: 'none' };
+    worker.gatherTimer = 0;
+    return;
+  }
+
   const resource = world.resourceForJob(worker.job);
   if (!resource) {
     sendIdleNearBase(world, worker);
@@ -397,6 +551,11 @@ function updateWorkerCycle(world: World, worker: Worker, dt: number): void {
   if (worker.phase === 'waiting') {
     worker.order = { type: 'none' };
     worker.gatherTimer = 0;
+    // Don't wake into work if the larder is empty
+    if (world.stockpile.food <= 0) {
+      enterStarving(world, worker);
+      return;
+    }
     const found = world.findWorkNode(worker.x, worker.y, resource);
     if (found) {
       claimNode(worker, found.node, found.slot);
@@ -628,12 +787,23 @@ function colorForResource(r: ResourceKind): string {
 
 function computeExpectedIncome(world: World): Stockpile {
   const income: Stockpile = { stone: 0, wood: 0, food: 0 };
+  let working = 0;
   for (const e of world.entities.values()) {
     if (!e.alive || e.kind !== 'worker') continue;
-    if (e.job === 'idle' || e.phase === 'waiting') continue;
+    if (e.job === 'idle') continue;
+    working += 1;
+    if (e.phase === 'waiting' || e.phase === 'starving') continue;
     const resource = world.resourceForJob(e.job);
     if (!resource || resource === 'fish') continue;
+    // Rough “per gather cycle” income for HUD (same unit as before)
     income[resource] += CONFIG.gatherAmount;
   }
+  // Net food: production minus upkeep over one gather-length window
+  // upkeep per cycle ≈ working * amount * (resourceTickInterval / upkeepInterval)
+  const upkeepPerCycle =
+    working *
+    CONFIG.workerFoodUpkeepAmount *
+    (CONFIG.resourceTickInterval / CONFIG.workerFoodUpkeepInterval);
+  income.food -= upkeepPerCycle;
   return income;
 }

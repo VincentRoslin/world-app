@@ -18,9 +18,12 @@ body,
 
 #game {
   display: block;
+  position: fixed;
+  inset: 0;
   width: 100%;
   height: 100%;
   cursor: crosshair;
+  z-index: 0;
 }
 
 #hud {
@@ -33,6 +36,7 @@ body,
 #hud button,
 #hud #panel,
 #hud #top-bar,
+#hud #worker-roster,
 #hud #minimap-wrap,
 #hud #minimap-tray,
 #hud #map-overlay,
@@ -80,6 +84,10 @@ body,
   color: #484f58;
 }
 
+.res .income.neg {
+  color: #f85149;
+}
+
 .res .income.flash {
   color: #56d364;
   text-shadow: 0 0 8px #3fb950aa;
@@ -112,6 +120,29 @@ body,
   color: #8b949e;
   font-variant-numeric: tabular-nums;
   font-size: 12px;
+  align-items: center;
+}
+
+.combat-lock {
+  color: #f85149;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.combat-lock.hidden {
+  display: none;
+}
+
+#btn-dev-cam {
+  opacity: 0.75;
+  font-size: 12px;
+}
+
+#btn-dev-cam.dev-on {
+  opacity: 1;
+  background: #3d2a00;
+  border-color: #e3b341;
+  color: #e3b341;
 }
 
 #minimap-wrap {
@@ -138,6 +169,14 @@ body,
   gap: 8px;
   margin-bottom: 6px;
   min-height: 22px;
+}
+
+.map-tile-coords {
+  margin-left: 8px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: #79c0ff;
+  letter-spacing: 0.02em;
 }
 
 .minimap-label {
@@ -333,14 +372,185 @@ button.danger {
   border-color: #da3633;
 }
 
+/* —— Worker roster (left) — overview of all workers —— */
+#worker-roster {
+  position: absolute;
+  left: 12px;
+  top: 56px;
+  width: 220px;
+  max-height: min(42vh, 340px);
+  display: flex;
+  flex-direction: column;
+  padding: 10px 10px 8px;
+  background: rgba(22, 27, 34, 0.92);
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  z-index: 20;
+  font-size: 12px;
+}
+
+.worker-roster-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.worker-roster-title {
+  font-weight: 700;
+  font-size: 13px;
+  color: #e6edf3;
+}
+
+#worker-roster-count {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: #8b949e;
+  font-size: 12px;
+}
+
+.worker-roster-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.worker-sum-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  color: #c9d1d9;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.worker-sum-chip i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.worker-sum-chip.idle i {
+  background: #8b949e;
+}
+.worker-sum-chip.mine i {
+  background: #8b949e;
+  box-shadow: 0 0 4px #8b949e88;
+}
+.worker-sum-chip.log i {
+  background: #3fb950;
+}
+.worker-sum-chip.farm i {
+  background: #e3b341;
+}
+.worker-sum-chip.build i {
+  background: #58a6ff;
+}
+
+.worker-roster-list {
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-height: 0;
+  flex: 1 1 auto;
+  scrollbar-width: thin;
+}
+
+.worker-roster-row {
+  display: grid;
+  grid-template-columns: 22px 1fr auto;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: #0d1117;
+  color: #e6edf3;
+  text-align: left;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1.25;
+}
+
+.worker-roster-row:hover {
+  border-color: #484f58;
+  background: #161b22;
+}
+
+.worker-roster-row.selected {
+  border-color: #58a6ff;
+  background: #1f6feb22;
+  box-shadow: 0 0 0 1px #58a6ff44;
+}
+
+.worker-roster-row .wr-id {
+  font-weight: 700;
+  color: #8b949e;
+  font-variant-numeric: tabular-nums;
+}
+
+.worker-roster-row .wr-job {
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.worker-roster-row .wr-job.mine {
+  color: #c9d1d9;
+}
+.worker-roster-row .wr-job.log {
+  color: #56d364;
+}
+.worker-roster-row .wr-job.farm {
+  color: #e3b341;
+}
+.worker-roster-row .wr-job.build {
+  color: #79c0ff;
+}
+.worker-roster-row .wr-job.idle {
+  color: #8b949e;
+}
+
+.worker-roster-row .wr-phase {
+  color: #8b949e;
+  font-size: 10px;
+  text-align: right;
+  max-width: 88px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.worker-roster-row.starving .wr-phase,
+.worker-roster-row.waiting .wr-phase {
+  color: #e3b341;
+}
+
+.worker-roster-empty {
+  color: #484f58;
+  font-size: 11px;
+  padding: 8px 4px;
+  text-align: center;
+}
+
 /* Selection / worker panel — bottom center (clears bag bar on the right) */
 #panel {
   position: absolute;
   left: 50%;
   bottom: 14px;
   transform: translateX(-50%);
-  width: min(360px, calc(100vw - 280px));
-  max-width: 380px;
+  width: min(400px, calc(100vw - 280px));
+  max-width: 420px;
   padding: 12px 16px;
   background: rgba(22, 27, 34, 0.92);
   border: 1px solid #30363d;
@@ -371,6 +581,11 @@ button.danger {
   flex-wrap: wrap;
   gap: 6px;
   justify-content: center;
+}
+
+#selection-actions button[title] {
+  /* Native title tooltips — keep buttons readable */
+  min-width: 4.2em;
 }
 
 /* Bag bar + character UI */

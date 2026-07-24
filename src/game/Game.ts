@@ -10,6 +10,7 @@ import { ShopUi } from '../ui/shop';
 import { World } from '../world/World';
 import { updateExploration } from '../systems/Exploration';
 import { updateShopInteract } from '../systems/ShopInteract';
+import { canLogout } from '../systems/Combat';
 
 export class Game {
   world = new World();
@@ -40,6 +41,7 @@ export class Game {
       () => this.restart(),
       () => this.save(),
       () => this.load(),
+      () => this.input.toggleDevCameraUnlock(),
     );
     this.restart();
     window.addEventListener('resize', () => this.renderer.resize());
@@ -65,6 +67,13 @@ export class Game {
   }
 
   load(): void {
+    // Load = session escape / logout surrogate — blocked during combat lock
+    if (!canLogout(this.world)) {
+      const hero = this.world.hero();
+      const left = hero?.combatLockTicks ?? 0;
+      this.world.message = `Cannot log out while in combat (${left} ticks left).`;
+      return;
+    }
     const raw = localStorage.getItem(CONFIG.saveKey);
     if (!raw) {
       this.world.message = 'No save found.';
@@ -125,6 +134,16 @@ export class Game {
 
     // After movement so follow tracks the hero; skipped when WASD/pan unlocked
     this.input.applyCameraFollow();
+
+    // Dev cam: stream + fully mark chunks under the camera every frame so
+    // panning reveals terrain without moving the hero.
+    if (this.input.isDevCameraUnlocked()) {
+      const look = this.renderer.screenToWorld(
+        window.innerWidth / 2,
+        window.innerHeight / 2,
+      );
+      updateExploration(this.world, { alsoAround: look });
+    }
 
     this.shopUi.update();
 

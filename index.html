@@ -29,9 +29,11 @@
             </span>
           </div>
           <div class="explore-info">
+            <span id="combat-lock" class="combat-lock hidden" title="Combat lock — logout blocked until 0">Combat —</span>
             <span id="explore-status">Explored —</span>
           </div>
           <div class="controls">
+            <button type="button" id="btn-dev-cam" title="Dev: unlock camera leash (temporary)">Dev cam</button>
             <button type="button" id="btn-help" title="Controls help">Help</button>
             <button type="button" id="btn-pause" title="Pause / Play">Pause</button>
             <button type="button" id="btn-save" title="Save">Save</button>
@@ -41,7 +43,15 @@
         <!-- Minimap: normal | minimized tray | expand opens full map overlay -->
         <div id="minimap-wrap">
           <div class="minimap-chrome">
-            <span class="minimap-label">Map</span>
+            <span class="minimap-label"
+              >Map
+              <span
+                id="map-tile-coords"
+                class="map-tile-coords"
+                title="Tile under cursor (world X, Y)"
+                >—</span
+              ></span
+            >
             <div class="minimap-actions">
               <button type="button" id="btn-minimap-min" title="Minimize map" aria-label="Minimize map">
                 −
@@ -74,6 +84,16 @@
             </p>
           </div>
         </div>
+        <!-- Worker overview: totals, jobs, click row to select -->
+        <div id="worker-roster" aria-label="Worker roster">
+          <div class="worker-roster-header">
+            <span class="worker-roster-title">Workers</span>
+            <span id="worker-roster-count">0/0</span>
+          </div>
+          <div id="worker-roster-summary" class="worker-roster-summary"></div>
+          <div id="worker-roster-list" class="worker-roster-list"></div>
+        </div>
+
         <div id="panel">
           <div id="selection-title">Nothing selected</div>
           <div id="selection-detail"></div>
@@ -171,15 +191,18 @@
         <div class="modal help-modal">
           <h2>Controls</h2>
           <p>
-            <strong>LMB</strong> select · <strong>RMB</strong> ground to move · <strong>RMB</strong> mob to attack<br />
+            <strong>LMB</strong> select unit/building · <strong>LMB</strong> empty ground to move<br />
+            <strong>RMB</strong> attack mob · open shop · fish · or move/flee on ground<br />
             <strong>WASD</strong> pan camera (unlocks follow) · <strong>F</strong> lock camera on hero ·
-            <strong>Scroll</strong> zoom · <strong>B</strong> bags · <strong>C</strong> character<br />
+            <strong>Scroll</strong> zoom (limited — explore by walking) · <strong>B</strong> bags · <strong>C</strong> character<br />
             Map: <strong>−</strong> minimize to tray · <strong>⛶</strong> full map · tray restores the mini map<br />
             <strong>Game tick</strong>: world advances every <strong>0.6s</strong>. Clicked
             actions apply on the <strong>next tick</strong>. Walk = 1 tile/tick.<br />
-            Workers: Mine / Log / Farm. Home square is safe — explore adjacent areas for cows, goblins,
-            humans.<br />
-            Combat: RMB a mob to attack · RMB ground to flee · one target at a time.<br />
+            Workers: select then Mine / Log / Farm (or LMB/RMB ground to walk them). Home is safe.<br />
+            Combat: RMB a mob · weapons wind up on the <strong>0.6s tick</strong> (hero = 4 ticks).<br />
+            Damage starts a <strong>16-tick combat lock</strong> (logout/load blocked until 0).<br />
+            Mobs path to you; pull them <strong>&gt;7 tiles</strong> from spawn and they walk home
+            (re-aggro if you hit them retreating, or touch inside the leash).<br />
             Shop: RMB Ebbe Greyho (north of base) — hero walks over and opens free shop.
           </p>
           <button type="button" id="btn-help-close">Close</button>

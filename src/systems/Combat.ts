@@ -1,6 +1,5 @@
 import { CONFIG, ENEMY_SPECIES } from '../config';
-import { dist, floorTile } from '../core/math';
-import { DIRS4 } from '../core/grid';
+import { dist } from '../core/math';
 import type { Enemy, EntityId, Hero } from '../core/types';
 import type { World } from '../world/World';
 import { issueAttack, issueMove } from './Movement';
@@ -17,18 +16,27 @@ import {
   skillLabel,
   type LevelUpEvent,
 } from './Skills';
+import { startHeroAttackContact } from './CharacterAnim';
 
 /**
- * Combat system (tick-based).
+ * Grid-based, tick-synced combat (CONFIG.gameTickSec ≈ 0.6s per tick).
  *
- * High-level flow each game tick (see GameTick.processGameTick → onGameTickCombat):
- * 1. Maintain fight queue / pack join / leash (soft death: escape by distance).
- * 2. Alternate hero ↔ front-enemy swings when both are in melee.
- * 3. Accuracy = meleeHitChance(attackRoll, defenceRoll); damage uniform 0..maxHit.
- * 4. Grant XP: one step (XP_PER_HIT) only when damage > 0 — no XP on misses / zero rolls.
+ * Each game tick (GameTick → onGameTickCombat):
+ * 1. Combat lock countdown (logout block) + fight layout / leash AI.
+ * 2. Aggressive NPCs pathfind to the player; weapon wind-ups only in melee.
+ * 3. Accuracy / damage rolls; XP only on damage > 0.
+ * 4. Group-hostile packs join only after the hero’s first swing.
+ * 5. Leash: if an aggressive NPC is pulled > enemyLeashDistance tiles from spawn,
+ *    it instantly loses target, ignores proximity, and walks to exact camp.
+ *    Re-aggro only if the player attacks while retreating, or touch occurs
+ *    still inside the leash radius (e.g. pathing blockage).
  *
  * Melee is orthogonal adjacency only (no diagonal) so positioning stays readable.
  */
+
+function isGroupHostile(species: Enemy['species']): boolean {
+  return ENEMY_SPECIES[species]?.groupHostile === true;
+}
 
 /** True when A and B share an edge (N/E/S/W). Diagonal does not count. */
 function inMeleeRange(ax: number, ay: number, bx: number, by: number): boolean {
@@ -37,10 +45,49 @@ function inMeleeRange(ax: number, ay: number, bx: number, by: number): boolean {
   return (dx === 1 && dy === 0) || (dx === 0 && dy === 1);
 }
 
+/** Same tile or any adjacent tile (incl. diagonal) — “touch” for leash re-aggro. */
+function tilesTouch(ax: number, ay: number, bx: number, by: number): boolean {
+  const dx = Math.abs(Math.floor(ax) - Math.floor(bx));
+  const dy = Math.abs(Math.floor(ay) - Math.floor(by));
+  return Math.max(dx, dy) <= 1;
+}
+
+function distFromSpawn(enemy: Enemy): number {
+  return dist(enemy.x, enemy.y, enemy.campX, enemy.campY);
+}
+
+function withinSpawnLeash(enemy: Enemy): boolean {
+  return distFromSpawn(enemy) <= CONFIG.enemyLeashDistance;
+}
+
+/** Refresh 16-tick combat lock on real damage dealt or taken. */
+function applyCombatLock(hero: Hero): void {
+  hero.combatLockTicks = CONFIG.combatLockTicks;
+  hero.combatTimer = 0;
+}
+
+/** True while combat lock ticks remain — logout must be blocked. */
+export function isCombatLocked(hero: Hero): boolean {
+  return hero.combatLockTicks > 0;
+}
+
+/** Session leave / load as logout surrogate while combat-locked. */
+export function canLogout(world: World): boolean {
+  const hero = world.hero();
+  if (!hero || !hero.alive) return true;
+  return hero.combatLockTicks <= 0;
+}
+
 export function setHeroCombatTarget(world: World, enemyId: EntityId, queueIfBusy: boolean): void {
   const hero = world.hero();
   const enemy = world.get(enemyId);
   if (!hero || !hero.alive || !enemy || enemy.kind !== 'enemy' || !enemy.alive) return;
+
+  // Attacking a retreating NPC → immediate re-aggro, reset leash, resume attack cycle
+  if (enemy.leashing) {
+    reaggroFromLeash(world, hero, enemy, true);
+    return;
+  }
 
   hero.combatEngaged = true;
 
@@ -53,11 +100,15 @@ export function setHeroCombatTarget(world: World, enemyId: EntityId, queueIfBusy
       world.message = `Fighting ${speciesName(enemy)}.`;
       return;
     }
-    // Only same pack can join mid-fight
+    // Manual click on a same-pack group-hostile — only after the fight has opened
+    // (first swing). Before that, treat as “next target” queue.
     const front = hero.combatTargetId != null ? world.get(hero.combatTargetId) : null;
     if (
+      hero.combatSwingLanded &&
       front &&
       front.kind === 'enemy' &&
+      isGroupHostile(front.species) &&
+      isGroupHostile(enemy.species) &&
       enemy.packId !== 0 &&
       enemy.packId === front.packId &&
       dist(enemy.x, enemy.y, front.x, front.y) <= CONFIG.fightGroupRadius
@@ -73,6 +124,39 @@ export function setHeroCombatTarget(world: World, enemyId: EntityId, queueIfBusy
   }
 
   beginFight(world, hero, enemyId);
+}
+
+/**
+ * Cancel walk-home, re-enter combat, full weapon wind-up.
+ * Used when the player hits a retreating NPC or touch re-aggro fires inside leash.
+ */
+function reaggroFromLeash(
+  world: World,
+  hero: Hero,
+  enemy: Enemy,
+  playerInitiated: boolean,
+): void {
+  enemy.leashing = false;
+  enemy.aggressive = true;
+  enemy.attackTimer = enemy.attackTicks;
+  enemy.order = { type: 'none' };
+
+  if (playerInitiated || !hero.combatEngaged || hero.fightQueue.length === 0) {
+    beginFight(world, hero, enemy.id);
+    world.message = playerInitiated
+      ? `${speciesName(enemy)} re-engages!`
+      : `${speciesName(enemy)} catches you — fight resumes!`;
+    return;
+  }
+
+  if (!hero.fightQueue.includes(enemy.id)) {
+    hero.fightQueue.unshift(enemy.id);
+  } else {
+    promoteToFront(world, hero, enemy.id);
+  }
+  assignRoles(world, hero);
+  layoutFight(world, hero);
+  world.message = `${speciesName(enemy)} re-engages!`;
 }
 
 export function clearHeroCombat(world: World, hero: Hero): void {
@@ -93,6 +177,8 @@ export function clearHeroCombat(world: World, hero: Hero): void {
   hero.combatStandX = null;
   hero.combatStandY = null;
   hero.combatEngaged = false;
+  hero.combatSwingLanded = false;
+  hero.combatInMelee = false;
   hero.combatTurn = 'hero';
   if (hero.order.type === 'attack') hero.order = { type: 'none' };
   // Drop queued player intents so a stale attack cannot re-engage next tick
@@ -111,17 +197,14 @@ function beginFight(world: World, hero: Hero, primaryId: EntityId): void {
   clearHeroCombat(world, hero);
   hero.combatEngaged = true;
   hero.combatTurn = 'hero'; // hero always opens
+  hero.combatSwingLanded = false;
+  hero.combatInMelee = false;
+  // Full weapon wind-up once melee starts (countdown pauses while walking in)
+  hero.attackTimer = hero.attackTicks;
+  primary.attackTimer = primary.attackTicks;
 
+  // 1v1 at fight start — packmates join later only if group-hostile + first swing
   hero.fightQueue = [primaryId];
-  // ONLY same pack within group radius — never random nearby packs
-  for (const e of world.entities.values()) {
-    if (!e.alive || e.kind !== 'enemy') continue;
-    if (e.id === primaryId) continue;
-    if (primary.packId === 0) continue;
-    if (e.packId !== primary.packId) continue;
-    if (dist(e.x, e.y, primary.x, primary.y) > CONFIG.fightGroupRadius) continue;
-    hero.fightQueue.push(e.id);
-  }
 
   assignRoles(world, hero);
   layoutFight(world, hero);
@@ -135,7 +218,40 @@ function beginFight(world: World, hero: Hero, primaryId: EntityId): void {
       issueAttack(hero, hero.combatTargetId);
     }
   }
-  world.message = `Fighting ${speciesName(primary)}.`;
+  const packHint =
+    isGroupHostile(primary.species) && primary.packId !== 0
+      ? ' (pack joins after first hit)'
+      : '';
+  world.message = `Fighting ${speciesName(primary)}.${packHint}`;
+}
+
+/**
+ * After the hero’s first swing this fight: pull same-pack group-hostile allies
+ * into the queue (goblins/humans). Cows never pull packmates.
+ */
+function pullGroupHostilesAfterFirstHit(world: World, hero: Hero, primary: Enemy): void {
+  if (!isGroupHostile(primary.species)) return;
+  if (primary.packId === 0) return;
+
+  let added = 0;
+  for (const e of world.entities.values()) {
+    if (!e.alive || e.kind !== 'enemy') continue;
+    if (e.id === primary.id) continue;
+    if (e.packId !== primary.packId) continue;
+    if (!isGroupHostile(e.species)) continue;
+    if (dist(e.x, e.y, primary.x, primary.y) > CONFIG.fightGroupRadius) continue;
+    if (hero.fightQueue.includes(e.id)) continue;
+    hero.fightQueue.push(e.id);
+    added++;
+  }
+  if (added <= 0) return;
+
+  assignRoles(world, hero);
+  layoutFight(world, hero);
+  world.message =
+    added === 1
+      ? `${speciesName(primary)} packmate joins the fight!`
+      : `${added} packmates join the fight!`;
 }
 
 function addToFightQueue(world: World, hero: Hero, enemyId: EntityId): void {
@@ -159,7 +275,7 @@ function promoteToFront(world: World, hero: Hero, enemyId: EntityId): void {
 function assignRoles(world: World, hero: Hero): void {
   hero.fightQueue = hero.fightQueue.filter((id) => {
     const e = world.get(id);
-    return e && e.alive && e.kind === 'enemy';
+    return e && e.alive && e.kind === 'enemy' && !e.leashing;
   });
 
   for (let i = 0; i < hero.fightQueue.length; i++) {
@@ -170,18 +286,12 @@ function assignRoles(world: World, hero: Hero): void {
     e.aggressive = true;
     e.leashing = false;
     if (i === 0) {
-      // Front: only engage once hero is adjacent (don't chase the player)
-      if (inMeleeRange(e.x, e.y, hero.x, hero.y)) {
-        if (e.order.type !== 'attack' || e.order.targetId !== hero.id) {
-          issueAttack(e, hero.id);
-        }
-      } else if (e.order.type === 'attack') {
-        e.order = { type: 'none' };
+      // Front: pathfind toward the player and attack (aggressive chase)
+      if (e.order.type !== 'attack' || e.order.targetId !== hero.id) {
+        issueAttack(e, hero.id);
       }
-      // leave move alone only if somehow set; front should hold
-      if (e.order.type === 'move') e.order = { type: 'none' };
     } else {
-      // Waiters: may path to lineup slots (layoutFight sets move). Cancel chase-attack.
+      // Waiters: lineup pathing only; never free-chase as a second attacker
       if (e.order.type === 'attack') e.order = { type: 'none' };
     }
   }
@@ -189,45 +299,25 @@ function assignRoles(world: World, hero: Hero): void {
 }
 
 /**
- * Hero walks to an ortho tile beside the front mob (front holds).
- * Waiters path into queue: behind the front, then hero flanks.
+ * Seat waiters + ensure the front chases the player.
+ *
+ * Important: never path the *hero* back onto the mob. After the initial player
+ * attack order, the mob closes the gap; swings only when adjacent.
  */
 function layoutFight(world: World, hero: Hero): void {
   if (!hero.combatEngaged) return;
   const frontId = hero.fightQueue[0];
   if (frontId == null) return;
   const front = world.get(frontId);
-  if (!front || front.kind !== 'enemy') return;
+  if (!front || front.kind !== 'enemy' || front.leashing) return;
 
-  const ftx = Math.floor(front.x);
-  const fty = Math.floor(front.y);
-
-  // Front holds its tile — hero closes the gap
-  front.x = ftx + 0.5;
-  front.y = fty + 0.5;
-  if (!inMeleeRange(front.x, front.y, hero.x, hero.y)) {
-    if (front.order.type === 'move' || front.order.type === 'attack') {
-      front.order = { type: 'none' };
-    }
+  // Front always pathfinds to the hero (aggressive chase)
+  if (front.order.type !== 'attack' || front.order.targetId !== hero.id) {
+    issueAttack(front, hero.id);
   }
 
-  const stand = pickHeroStandTile(world, hero, ftx, fty);
-  if (stand) {
-    hero.combatStandX = stand.x + 0.5;
-    hero.combatStandY = stand.y + 0.5;
-    if (Math.floor(hero.x) !== stand.x || Math.floor(hero.y) !== stand.y) {
-      issueMove(world, hero, stand.x + 0.5, stand.y + 0.5);
-    } else {
-      hero.x = stand.x + 0.5;
-      hero.y = stand.y + 0.5;
-      if (hero.order.type === 'move') hero.order = { type: 'none' };
-      issueAttack(hero, front.id);
-      if (inMeleeRange(hero.x, hero.y, front.x, front.y)) {
-        issueAttack(front, hero.id);
-      }
-    }
-  }
-
+  // Waiter lineup relative to where the hero actually is (no forced hero walk)
+  const stand = { x: Math.floor(hero.x), y: Math.floor(hero.y) };
   placeWaiters(world, hero, front, stand);
 }
 
@@ -315,37 +405,6 @@ function placeWaiters(
   }
 }
 
-function pickHeroStandTile(
-  world: World,
-  hero: Hero,
-  ftx: number,
-  fty: number,
-): { x: number; y: number } | null {
-  const from = floorTile(hero.x, hero.y);
-  let best: { x: number; y: number } | null = null;
-  let bestD = Infinity;
-  for (const d of DIRS4) {
-    const x = ftx + d.x;
-    const y = fty + d.y;
-    if (!world.isWalkable(x, y)) continue;
-    if (tileOccupied(world, x, y, hero.id)) continue;
-    const dMan = Math.abs(x - from.gx) + Math.abs(y - from.gy);
-    if (dMan < bestD) {
-      bestD = dMan;
-      best = { x, y };
-    }
-  }
-  if (!best) {
-    for (const d of DIRS4) {
-      const x = ftx + d.x;
-      const y = fty + d.y;
-      if (!world.isWalkable(x, y)) continue;
-      return { x, y };
-    }
-  }
-  return best;
-}
-
 function tileOccupied(world: World, gx: number, gy: number, ignoreId: EntityId): boolean {
   for (const e of world.entities.values()) {
     if (!e.alive || e.id === ignoreId) continue;
@@ -366,6 +425,8 @@ function speciesName(e: Enemy): string {
 export function onGameTickCombat(world: World): void {
   const hero = world.hero();
   if (hero && hero.alive) {
+    // Combat lock: 1 tick per game tick until 0 (logout unblocked)
+    if (hero.combatLockTicks > 0) hero.combatLockTicks -= 1;
     hero.combatTimer += CONFIG.gameTickSec;
     if (hero.combatEngaged) {
       maintainCombatMovement(world, hero);
@@ -381,8 +442,12 @@ export function onGameTickCombat(world: World): void {
   processDeaths(world);
 
   if (hero && hero.alive) {
-    if (hero.combatTimer >= CONFIG.heroCombatGrace && hero.hp < hero.maxHp) {
-      // Regen scaled per tick (≈ old per-second rate)
+    // Regen only when combat lock is clear and grace has elapsed
+    if (
+      hero.combatLockTicks <= 0 &&
+      hero.combatTimer >= CONFIG.heroCombatGrace &&
+      hero.hp < hero.maxHp
+    ) {
       hero.hp = Math.min(
         hero.maxHp,
         hero.hp + CONFIG.heroHpRegenPerSec * CONFIG.gameTickSec,
@@ -399,23 +464,14 @@ export function onGameTickCombat(world: World): void {
   world.removeDead();
 }
 
-/** True if both hero and enemy are still within camp leash (tiles). */
-function withinCampLeash(hero: Hero, enemy: Enemy): boolean {
-  const lim = CONFIG.enemyLeashDistance;
-  return (
-    dist(enemy.x, enemy.y, enemy.campX, enemy.campY) <= lim &&
-    dist(hero.x, hero.y, enemy.campX, enemy.campY) <= lim
-  );
-}
-
 function maintainCombatMovement(world: World, hero: Hero): void {
   if (!hero.combatEngaged || hero.fightQueue.length === 0) return;
 
-  // Light refresh: drop dead from queue
+  // Drop dead / retreating mobs — leash return is owned by enemy AI
   const prevFront = hero.combatTargetId;
   hero.fightQueue = hero.fightQueue.filter((id) => {
     const e = world.get(id);
-    return e && e.alive && e.kind === 'enemy';
+    return e && e.alive && e.kind === 'enemy' && !e.leashing;
   });
   if (hero.fightQueue.length === 0) {
     promoteNext(world, hero);
@@ -429,36 +485,19 @@ function maintainCombatMovement(world: World, hero: Hero): void {
   const frontId = hero.fightQueue[0];
   if (frontId == null) return;
   const front = world.get(frontId);
-  if (!front || front.kind !== 'enemy' || !front.alive) {
+  if (!front || front.kind !== 'enemy' || !front.alive || front.leashing) {
     promoteNext(world, hero);
     return;
   }
   hero.combatTargetId = frontId;
 
-  // Broke camp leash (10 tiles) — drop combat; mobs return home via AI
-  if (!withinCampLeash(hero, front)) {
-    const savedMove = world.pendingMove;
-    // Keep current flee path if any
-    const fleeOrder = hero.order.type === 'move' ? hero.order : null;
-    clearHeroCombat(world, hero);
-    if (fleeOrder) hero.order = fleeOrder;
-    world.pendingMove = savedMove;
-    world.message = 'You escape the fight.';
-    return;
+  // Ensure the front is always chasing the player while engaged
+  if (front.order.type !== 'attack' || front.order.targetId !== hero.id) {
+    issueAttack(front, hero.id);
   }
 
-  const sx = hero.combatStandX;
-  const sy = hero.combatStandY;
-  const movingToStand =
-    hero.order.type === 'move' &&
-    sx != null &&
-    sy != null &&
-    hero.order.tx === Math.floor(sx) &&
-    hero.order.ty === Math.floor(sy);
-
-  // Free flee/kite: never rewrite hero movement while they're walking somewhere
-  // other than the combat stand. Front chases via enemy AI; fight stays queued.
-  if (hero.order.type === 'move' && !movingToStand) {
+  // Player walk / kite: never rewrite the hero's path back to the mob
+  if (hero.order.type === 'move') {
     hero.combatStandX = null;
     hero.combatStandY = null;
     return;
@@ -466,48 +505,27 @@ function maintainCombatMovement(world: World, hero: Hero): void {
 
   const inMelee = inMeleeRange(hero.x, hero.y, front.x, front.y);
 
-  // After kiting (stand cleared): do not pull hero back across the map.
-  // Only resume fighting when the leashed mob is actually in melee.
-  if ((sx == null || sy == null) && !inMelee) {
-    return;
-  }
-
-  // Melee contact while still leashed → resume combat in place
+  // Adjacent → plant and swing. Out of melee the mob closes; hero only walks in
+  // if they still have a player-issued attack order (initial engage / re-click).
   if (inMelee) {
     hero.combatStandX = Math.floor(hero.x) + 0.5;
     hero.combatStandY = Math.floor(hero.y) + 0.5;
     hero.x = hero.combatStandX;
     hero.y = hero.combatStandY;
-    if (hero.order.type === 'move') hero.order = { type: 'none' };
     if (hero.order.type !== 'attack' || hero.order.targetId !== front.id) {
       issueAttack(hero, front.id);
     }
     return;
   }
 
-  // Initial engage / after promote: walk to stand beside the front (stand still set)
-  const nsx = hero.combatStandX;
-  const nsy = hero.combatStandY;
-  if (nsx == null || nsy == null) return;
-
-  const onStand =
-    Math.floor(hero.x) === Math.floor(nsx) && Math.floor(hero.y) === Math.floor(nsy);
-  if (!onStand) {
-    if (
-      hero.order.type !== 'move' ||
-      hero.order.tx !== Math.floor(nsx) ||
-      hero.order.ty !== Math.floor(nsy)
-    ) {
-      issueMove(world, hero, nsx, nsy);
-    }
-  } else {
-    hero.x = nsx;
-    hero.y = nsy;
-    if (hero.order.type === 'move') hero.order = { type: 'none' };
-    if (hero.order.type !== 'attack' || hero.order.targetId !== front.id) {
-      issueAttack(hero, front.id);
-    }
+  // Not adjacent: do not path the hero to a stand tile.
+  // Keep attack order if the player is still walking in; otherwise idle and wait.
+  hero.combatStandX = null;
+  hero.combatStandY = null;
+  if (hero.order.type === 'attack' && hero.order.targetId === front.id) {
+    return; // Movement follows attack → tile next to target
   }
+  // Standing still / finished flee: stay put until the mob reaches ortho adjacency
 }
 
 function processCombatSwings(world: World): void {
@@ -521,36 +539,49 @@ function processCombatSwings(world: World): void {
     return;
   }
 
-  // Must be in melee for either side to swing
+  // Must be ortho-adjacent for either side to swing / wind up.
+  // Do NOT layoutFight here — that used to path the hero back to the mob.
   const inMelee = inMeleeRange(hero.x, hero.y, front.x, front.y);
   if (!inMelee) {
-    // Same-tile or diagonal stall — re-layout so someone takes an ortho stand
-    const sameTile =
-      Math.floor(hero.x) === Math.floor(front.x) && Math.floor(hero.y) === Math.floor(front.y);
-    if (sameTile || hero.combatStandX == null) {
-      layoutFight(world, hero);
+    hero.combatInMelee = false;
+    return;
+  }
+
+  // Entering melee: start a full weapon wind-up if not already counting
+  if (!hero.combatInMelee) {
+    hero.combatInMelee = true;
+    if (hero.attackTimer <= 0) hero.attackTimer = hero.attackTicks;
+    if (front.attackTimer <= 0) front.attackTimer = front.attackTicks;
+  }
+
+  // Both weapons tick down independently while in range (true N-tick weapon speed).
+  // Old alternating logic zeroed the other side’s timer every swing → felt like 1–2 tick attacks.
+  if (hero.attackTimer > 0) hero.attackTimer -= 1;
+  if (front.attackTimer > 0) front.attackTimer -= 1;
+
+  const heroReady = hero.attackTimer <= 0;
+  const enemyReady = front.attackTimer <= 0;
+
+  // Prefer hero opening when both ready the same tick
+  if (heroReady && enemyReady) {
+    if (hero.combatTurn === 'enemy') {
+      processEnemyAttackTick(world, front, hero);
+      if (!hero.alive || front.hp <= 0) return;
+      processHeroAttackTick(world, hero, front);
+    } else {
+      processHeroAttackTick(world, hero, front);
+      if (!hero.alive || front.hp <= 0) return;
+      processEnemyAttackTick(world, front, hero);
     }
     return;
   }
 
-  // Alternating turns: hero → enemy → hero → enemy
-  if (hero.combatTurn === 'hero') {
-    if (hero.attackTimer > 0) {
-      hero.attackTimer -= 1;
-      return;
-    }
+  if (heroReady) {
     processHeroAttackTick(world, hero, front);
-    hero.combatTurn = 'enemy';
-    // Front mob ready on next turn (no stacked delay)
-    front.attackTimer = 0;
-  } else {
-    if (front.attackTimer > 0) {
-      front.attackTimer -= 1;
-      return;
-    }
+    return;
+  }
+  if (enemyReady && front.hp > 0) {
     processEnemyAttackTick(world, front, hero);
-    hero.combatTurn = 'hero';
-    hero.attackTimer = 0;
   }
 }
 
@@ -558,34 +589,47 @@ function processCombatSwings(world: World): void {
  * Resolve one hero weapon swing. Resets attackTimer to weapon speed (ticks).
  * XP: only when damage > 0 (misses and 0-damage rolls grant nothing).
  * One training step per successful hit to Attack + Strength (not scaled by damage).
+ * First swing this fight pulls group-hostile packmates into the queue.
  */
 function processHeroAttackTick(world: World, hero: Hero, target: Enemy): void {
   hero.attackTimer = hero.attackTicks;
-  hero.combatTimer = 0;
+  hero.combatTurn = 'enemy';
+  // Contact keyframe (stepped attack clip) — holds until next game tick
+  startHeroAttackContact(hero);
+
+  const firstSwing = !hero.combatSwingLanded;
+  hero.combatSwingLanded = true;
 
   const hit = rollHeroHit(world, hero, target);
   if (hit.damage <= 0) {
-    world.spawnFloatText(target.x, target.y, '0', '#58a6ff');
-    return;
+    world.spawnFloatText(target.x, target.y, '0', '#58a6ff', 'miss');
+  } else {
+    target.hp -= hit.damage;
+    world.spawnFloatText(target.x, target.y, String(hit.damage), '#ffffff', 'hitsplat');
+    applyCombatLock(hero); // dealing damage → 16-tick lock (refresh)
+    grantXp(world, hero, 'attack', XP_PER_HIT);
+    grantXp(world, hero, 'strength', XP_PER_HIT);
   }
-  target.hp -= hit.damage;
-  world.spawnFloatText(target.x, target.y, `-${hit.damage}`, '#f85149');
-  grantXp(world, hero, 'attack', XP_PER_HIT);
-  grantXp(world, hero, 'strength', XP_PER_HIT);
+
+  // Pack joins after the first completed swing (miss or hit) — not on click/walk-in
+  if (firstSwing) {
+    pullGroupHostilesAfterFirstHit(world, hero, target);
+  }
 }
 
 function processEnemyAttackTick(world: World, enemy: Enemy, hero: Hero): void {
   if (enemy.fightRole !== 'front') return;
   enemy.attackTimer = enemy.attackTicks;
-  hero.combatTimer = 0;
+  hero.combatTurn = 'hero';
 
   const dmg = rollEnemyHit(world, hero, enemy);
   if (dmg <= 0) {
-    world.spawnFloatText(hero.x, hero.y, '0', '#58a6ff');
+    world.spawnFloatText(hero.x, hero.y, '0', '#58a6ff', 'miss');
     return;
   }
   hero.hp -= dmg;
-  world.spawnFloatText(hero.x, hero.y, `-${dmg}`, '#ffa198');
+  world.spawnFloatText(hero.x, hero.y, String(dmg), '#ffffff', 'hitsplat');
+  applyCombatLock(hero); // taking damage → 16-tick lock (refresh)
   grantXp(world, hero, 'defense', XP_PER_HIT);
 
   if (hero.hp <= 0) {
@@ -672,14 +716,17 @@ function promoteNext(world: World, hero: Hero): void {
     return dist(hero.x, hero.y, ea.x, ea.y) - dist(hero.x, hero.y, eb.x, eb.y);
   });
 
-  // Drop full weapon cooldown after a kill — swing again on the next game tick (~0.6s)
-  // once in melee, instead of waiting the whole attackTicks (e.g. 4 × 0.6s).
+  // Keep full weapon wind-up between kills (heroAttackTicks / enemy attackTicks)
   hero.combatTurn = 'hero';
-  hero.attackTimer = 0;
+  hero.attackTimer = hero.attackTicks;
+  hero.combatInMelee = false;
 
   assignRoles(world, hero);
   const frontId = hero.combatTargetId;
   const front = frontId != null ? world.get(frontId) : null;
+  if (front && front.kind === 'enemy') {
+    front.attackTimer = front.attackTicks;
+  }
 
   // Already next to the new front: keep standing, no repath delay
   if (front && front.kind === 'enemy' && inMeleeRange(hero.x, hero.y, front.x, front.y)) {
@@ -693,9 +740,9 @@ function promoteNext(world: World, hero: Hero): void {
     front.y = fy + 0.5;
     hero.combatStandX = hero.x;
     hero.combatStandY = hero.y;
+    hero.combatInMelee = true;
     if (hero.order.type === 'move') hero.order = { type: 'none' };
     if (front.order.type === 'move') front.order = { type: 'none' };
-    front.attackTimer = 0;
     issueAttack(hero, front.id);
     issueAttack(front, hero.id);
     // Still seat remaining waiters behind the new front
@@ -704,13 +751,10 @@ function promoteNext(world: World, hero: Hero): void {
   }
 
   layoutFight(world, hero);
-  if (front && front.kind === 'enemy') front.attackTimer = 0;
-  // Preserve stand approach move; only force attack order when not walking
+  // Only auto-engage the hero if already adjacent — otherwise the next front walks to us
   if (hero.combatTargetId != null && hero.order.type !== 'move') {
     const f = world.get(hero.combatTargetId);
     if (f && f.kind === 'enemy' && inMeleeRange(hero.x, hero.y, f.x, f.y)) {
-      issueAttack(hero, hero.combatTargetId);
-    } else if (hero.combatStandX == null) {
       issueAttack(hero, hero.combatTargetId);
     }
   }
@@ -725,87 +769,128 @@ function layoutWaitingOnly(world: World, hero: Hero, front: Enemy): void {
   placeWaiters(world, hero, front, stand);
 }
 
+/**
+ * Per-enemy leash + chase AI (tick-synced decisions; continuous movement follows orders).
+ *
+ * States:
+ * - leashing: walk exact spawn; ignore player proximity; touch inside leash → re-aggro
+ * - aggressive / front: pathfind to player; if pulled past leash → instant leash return
+ * - waiting: lineup only
+ */
 function updateEnemyMovementAi(world: World, enemy: Enemy, hero: Hero | undefined): void {
-  const fromCamp = dist(enemy.x, enemy.y, enemy.campX, enemy.campY);
-  if ((enemy.aggressive || enemy.fightRole !== 'idle') && fromCamp > CONFIG.enemyLeashDistance) {
-    if (hero) {
-      const idx = hero.fightQueue.indexOf(enemy.id);
-      if (idx >= 0) {
-        hero.fightQueue.splice(idx, 1);
-        if (hero.combatEngaged) {
-          if (idx === 0) promoteNext(world, hero);
-          else assignRoles(world, hero);
-        }
-      }
-    }
-    enemy.leashing = true;
-    enemy.aggressive = false;
-    enemy.fightRole = 'idle';
-    enemy.queueIndex = -1;
-    issueMove(world, enemy, enemy.campX, enemy.campY);
-    return;
-  }
-
+  // --- Retreating to spawn ---
   if (enemy.leashing) {
-    const home = dist(enemy.x, enemy.y, enemy.campX, enemy.campY);
-    if (home < 0.55) {
+    // Pathing blockage / catch-up: touch player still inside spawn boundary → re-aggro
+    if (
+      hero &&
+      hero.alive &&
+      withinSpawnLeash(enemy) &&
+      tilesTouch(enemy.x, enemy.y, hero.x, hero.y)
+    ) {
+      reaggroFromLeash(world, hero, enemy, false);
+      return;
+    }
+
+    // Ignore player proximity otherwise — keep walking home
+    const home = distFromSpawn(enemy);
+    if (home < 0.4) {
       enemy.leashing = false;
       enemy.x = enemy.campX;
       enemy.y = enemy.campY;
       enemy.order = { type: 'none' };
       enemy.hp = enemy.maxHp;
-    } else if (enemy.order.type !== 'move') {
-      issueMove(world, enemy, enemy.campX, enemy.campY);
+      enemy.aggressive = false;
+      enemy.fightRole = 'idle';
+      enemy.queueIndex = -1;
+    } else {
+      const gx = Math.floor(enemy.campX);
+      const gy = Math.floor(enemy.campY);
+      if (
+        enemy.order.type !== 'move' ||
+        enemy.order.tx !== gx ||
+        enemy.order.ty !== gy
+      ) {
+        issueMove(world, enemy, enemy.campX, enemy.campY);
+      }
     }
     return;
   }
 
-  // Front: hold while hero approaches; chase if hero kites inside camp leash.
-  // Outside leash → return-to-camp block above.
+  // --- Leash break: pulled past spawn boundary ---
+  const inFight = enemy.aggressive || enemy.fightRole !== 'idle';
+  if (inFight && !withinSpawnLeash(enemy)) {
+    beginLeashReturn(world, enemy, hero);
+    return;
+  }
 
-  if (enemy.fightRole === 'front' && hero && hero.combatEngaged) {
-    if (!withinCampLeash(hero, enemy)) {
-      return;
-    }
+  // --- Aggressive front: pathfind toward player and attack ---
+  if (enemy.fightRole === 'front' && hero && hero.alive && hero.combatEngaged) {
     if (inMeleeRange(enemy.x, enemy.y, hero.x, hero.y)) {
       if (enemy.order.type === 'move') enemy.order = { type: 'none' };
       if (enemy.order.type !== 'attack' || enemy.order.targetId !== hero.id) {
         issueAttack(enemy, hero.id);
       }
-    } else {
-      const sx = hero.combatStandX;
-      const sy = hero.combatStandY;
-      const heroApproachingStand =
-        hero.order.type === 'move' &&
-        sx != null &&
-        sy != null &&
-        hero.order.tx === Math.floor(sx) &&
-        hero.order.ty === Math.floor(sy);
-      const heroKiting = hero.order.type === 'move' && !heroApproachingStand;
-
-      if (heroKiting) {
-        // Leash onto the player while they walk away (within 10 tiles of camp)
-        if (enemy.order.type !== 'attack' || enemy.order.targetId !== hero.id) {
-          issueAttack(enemy, hero.id);
-        }
-      } else {
-        // Hero walking in or standing still — hold; hero resumes approach
-        if (enemy.order.type === 'attack' || enemy.order.type === 'move') {
-          enemy.order = { type: 'none' };
-        }
-      }
+    } else if (enemy.order.type !== 'attack' || enemy.order.targetId !== hero.id) {
+      issueAttack(enemy, hero.id);
     }
+    return;
   }
 
   if (enemy.fightRole === 'waiting') {
-    // Lineup pathing OK; don't free-chase as a second attacker
     if (enemy.order.type === 'attack') enemy.order = { type: 'none' };
+    return;
+  }
+
+  if (enemy.aggressive && hero && hero.alive && hero.combatEngaged) {
+    if (enemy.order.type !== 'attack' || enemy.order.targetId !== hero.id) {
+      issueAttack(enemy, hero.id);
+    }
+    return;
   }
 
   if (enemy.fightRole === 'idle' && enemy.aggressive && !hero?.combatEngaged) {
-    // Was in a fight that ended — reset
     enemy.aggressive = false;
     enemy.order = { type: 'none' };
+  }
+}
+
+/** Instantly drop target and walk back to exact spawn. */
+function beginLeashReturn(world: World, enemy: Enemy, hero: Hero | undefined): void {
+  let wasFront = false;
+  let hadFight = false;
+
+  if (hero) {
+    hadFight = hero.combatEngaged;
+    const idx = hero.fightQueue.indexOf(enemy.id);
+    wasFront = idx === 0 || hero.combatTargetId === enemy.id;
+    if (idx >= 0) {
+      hero.fightQueue.splice(idx, 1);
+    }
+    if (hero.combatTargetId === enemy.id) {
+      hero.combatTargetId = hero.fightQueue[0] ?? null;
+    }
+  }
+
+  enemy.leashing = true;
+  enemy.aggressive = false;
+  enemy.fightRole = 'idle';
+  enemy.queueIndex = -1;
+  enemy.order = { type: 'none' };
+  issueMove(world, enemy, enemy.campX, enemy.campY);
+
+  if (hero && hadFight) {
+    if (hero.fightQueue.length === 0) {
+      const fleeOrder = hero.order.type === 'move' ? hero.order : null;
+      clearHeroCombat(world, hero);
+      if (fleeOrder) hero.order = fleeOrder;
+      world.message = 'The enemy retreats to its spawn.';
+    } else if (wasFront) {
+      promoteNext(world, hero);
+      world.message = `${speciesName(enemy)} breaks leash.`;
+    } else {
+      assignRoles(world, hero);
+      world.message = `${speciesName(enemy)} breaks leash.`;
+    }
   }
 }
 

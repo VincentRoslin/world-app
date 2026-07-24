@@ -25,6 +25,94 @@ export function drawDiamond(
 }
 
 /**
+ * Soft oval under standing units — grounds sprites on the tile (tactical feel).
+ * Draw before the body so it sits “on” the floor.
+ */
+export function drawGroundShadow(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  rx = 11,
+  ry = 5,
+): void {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.32)';
+  ctx.beginPath();
+  ctx.ellipse(cx, cy + 1, rx, ry, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+/**
+ * Yellow destination flag/tile for the hero’s current move goal.
+ * Readable pathing feedback without cluttering every step.
+ */
+export function drawDestinationMarker(
+  ctx: CanvasRenderingContext2D,
+  cx: number,
+  cy: number,
+  tileW: number,
+  tileH: number,
+): void {
+  const w = tileW * 0.72;
+  const h = tileH * 0.72;
+  ctx.save();
+  ctx.globalAlpha = 0.55;
+  ctx.strokeStyle = '#e3b341';
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - h / 2);
+  ctx.lineTo(cx + w / 2, cy);
+  ctx.lineTo(cx, cy + h / 2);
+  ctx.lineTo(cx - w / 2, cy);
+  ctx.closePath();
+  ctx.stroke();
+  // Small X in the middle
+  ctx.globalAlpha = 0.9;
+  ctx.lineWidth = 2;
+  const s = 5;
+  ctx.beginPath();
+  ctx.moveTo(cx - s, cy - s * 0.45);
+  ctx.lineTo(cx + s, cy + s * 0.45);
+  ctx.moveTo(cx + s, cy - s * 0.45);
+  ctx.lineTo(cx - s, cy + s * 0.45);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/**
+ * Combat hitsplat box — damage number in a solid square (miss = blue).
+ */
+export function drawHitsplat(
+  ctx: CanvasRenderingContext2D,
+  sx: number,
+  sy: number,
+  text: string,
+  kind: 'hit' | 'miss',
+  alpha: number,
+): void {
+  const bg = kind === 'miss' ? '#3d7ead' : '#c43c3c';
+  const edge = kind === 'miss' ? '#79c0ff' : '#f85149';
+  const size = 22;
+  ctx.save();
+  ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+  ctx.fillStyle = bg;
+  ctx.strokeStyle = edge;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(sx - size / 2, sy - size / 2, size, size, 3);
+  ctx.fill();
+  ctx.stroke();
+  ctx.font = 'bold 13px system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(text, sx, sy + 0.5);
+  ctx.restore();
+}
+
+/**
  * Soft “you can interact with this” ground ring for a single footprint.
  * Drawn under the entity — low alpha, gentle pulse, not a hard select look.
  */

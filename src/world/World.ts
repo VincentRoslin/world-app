@@ -48,9 +48,18 @@ export class World {
   worldSeed = 42;
   tiles = new Map<string, Tile>();
   loadedChunks = new Set<string>();
+  /**
+   * Bumps when a chunk is added so the 3D renderer can mesh only new chunks
+   * instead of rebuilding the whole world each stream.
+   */
+  terrainVersion = 0;
+  /** Bumps on reset/load so the 3D view fully remeshes even with the same seed. */
+  terrainEpoch = 0;
   explored = new Set<string>();
   entities = new Map<EntityId, Entity>();
   nextId = 1;
+  /** Next human-facing worker number (#1, #2, …). Independent of entity ids. */
+  nextWorkerRosterNo = 1;
   nextPackId = 1;
 
   stockpile: Stockpile = { stone: 0, wood: 0, food: 0 };
@@ -107,10 +116,13 @@ export class World {
     this.worldSeed = seed;
     this.tiles.clear();
     this.loadedChunks.clear();
+    this.terrainVersion = 0;
+    this.terrainEpoch += 1;
     this.explored.clear();
     this.entities.clear();
     this.nextId = 1;
     this.nextPackId = 1;
+    this.nextWorkerRosterNo = 1;
     this.selectedId = null;
     this.hoverTile = null;
     this.hoverEntityId = null;
@@ -153,6 +165,18 @@ export class World {
   isWalkable(gx: number, gy: number): boolean {
     const t = this.tileAt(gx, gy);
     return !!t && !t.blocked;
+  }
+
+  /**
+   * Pathfinding step cost multiplier (A*). Lower = preferred.
+   * Dirt/sand roads are slightly faster routes than open grass.
+   */
+  pathCost(gx: number, gy: number): number {
+    const t = this.tileAt(gx, gy);
+    if (!t || t.blocked) return Infinity;
+    if (t.terrain === 'dirt' || t.terrain === 'sand') return 0.82;
+    if (t.terrain === 'snow') return 1.12;
+    return 1;
   }
 
   /** Mark a tile solid so nothing can path or stand on it. */
@@ -202,6 +226,8 @@ export class World {
     return this.explored.has(tileKey(gx, gy));
   }
 
+
+
   markExplored(gx: number, gy: number): void {
     this.explored.add(tileKey(gx, gy));
   }
@@ -241,6 +267,7 @@ export class World {
       this.maxGy = Math.max(this.maxGy, gy);
     }
     this.loadedChunks.add(key);
+    this.terrainVersion += 1;
 
     for (const r of content.resources) {
       this.createResourceNode(r.x, r.y, r.resource);
@@ -288,13 +315,12 @@ export class World {
       }
     }
 
-    // Home fully explored
-    if (isHome || (cx === 0 && cy === 0)) {
-      const { ox, oy } = chunkOrigin(cx, cy);
-      for (let y = 0; y < CONFIG.chunkSize; y++) {
-        for (let x = 0; x < CONFIG.chunkSize; x++) {
-          this.markExplored(ox + x, oy + y);
-        }
+    // Whole chunk is known as soon as it loads (no walk-to-reveal fog).
+    // Distant tiles can still be drawn slightly dimmer in the renderer.
+    const { ox, oy } = chunkOrigin(cx, cy);
+    for (let y = 0; y < CONFIG.chunkSize; y++) {
+      for (let x = 0; x < CONFIG.chunkSize; x++) {
+        this.markExplored(ox + x, oy + y);
       }
     }
   }
@@ -446,17 +472,24 @@ export class World {
       attackTicks: CONFIG.heroAttackTicks,
       attackTimer: 0,
       combatTimer: 99,
+      combatLockTicks: 0,
       combatTargetId: null,
       queuedTargetId: null,
       fightQueue: [],
       combatStandX: null,
       combatStandY: null,
       combatEngaged: false,
+      combatSwingLanded: false,
+      combatInMelee: false,
       combatTurn: 'hero',
       skills: createDefaultSkills(),
       order: { type: 'none' },
       fishingTimer: 0,
       fishingNodeId: null,
+      animClip: 'idle',
+      animFrame: 0,
+      animFacing: 1,
+      animHoldTick: false,
     };
     this.entities.set(e.id, e);
     applyHeroStats(e, this.inventory);
@@ -493,6 +526,7 @@ export class World {
     const e: Worker = {
       id: this.allocId(),
       kind: 'worker',
+      rosterNo: this.nextWorkerRosterNo++,
       x,
       y,
       prevX: x,
@@ -509,13 +543,20 @@ export class World {
       carried: 0,
       carriedResource: null,
       constructionId: null,
+      foodUpkeepAcc: 0,
       order: { type: 'none' },
     };
     this.entities.set(e.id, e);
     return e;
   }
 
-  spawnFloatText(x: number, y: number, text: string, color: string): void {
+  spawnFloatText(
+    x: number,
+    y: number,
+    text: string,
+    color: string,
+    style: import('../core/types').FloatTextStyle = 'plain',
+  ): void {
     this.floatTexts.push({
       id: this.nextFloatId++,
       x,
@@ -524,6 +565,7 @@ export class World {
       color,
       age: 0,
       lifetime: CONFIG.floatTextLifetime,
+      style,
     });
   }
 
@@ -1070,9 +1112,8 @@ export class World {
     for (const e of this.entities.values()) {
       if (!e.alive) continue;
       if (kinds && !kinds.includes(e.kind)) continue;
-      // Hide unexplored entities from picking (except own units / base)
-      if (e.kind === 'enemy' || e.kind === 'resourceNode') {
-        if (!this.isExplored(Math.floor(e.x), Math.floor(e.y))) continue;
+      if (e.kind === 'resourceNode' || e.kind === 'enemy') {
+        if (!this.tileAt(Math.floor(e.x), Math.floor(e.y))) continue;
       }
       if (e.kind === 'resourceNode') {
         if (Math.floor(e.x) === gx && Math.floor(e.y) === gy) return e;
@@ -1110,18 +1151,21 @@ export class World {
     for (const e of this.entities.values()) {
       if (!e.alive) continue;
       if (kinds && !kinds.includes(e.kind)) continue;
-      if (e.kind === 'enemy' || e.kind === 'resourceNode') {
-        if (!this.isExplored(Math.floor(e.x), Math.floor(e.y))) continue;
+      if (e.kind === 'resourceNode' || e.kind === 'enemy') {
+        if (!this.tileAt(Math.floor(e.x), Math.floor(e.y))) continue;
       }
-      if (e.kind === 'base') {
-        // Distance to 2×2 footprint center
-        const dx = e.x - wx;
-        const dy = e.y - wy;
-        const d = dx * dx + dy * dy;
-        // Slightly larger radius for big footprint
-        if (d < (radius + 0.6) ** 2 && d < bestD) {
-          bestD = d;
-          best = e;
+      if (e.kind === 'base' || e.kind === 'blacksmith') {
+        // Only the actual 2×2 footprint — no oversized radius that steals neighbor tiles
+        const ox = Math.floor(e.x) - 1;
+        const oy = Math.floor(e.y) - 1;
+        const gx = Math.floor(wx);
+        const gy = Math.floor(wy);
+        if (gx >= ox && gx < ox + 2 && gy >= oy && gy < oy + 2) {
+          const d = (e.x - wx) ** 2 + (e.y - wy) ** 2;
+          if (d < bestD) {
+            bestD = d;
+            best = e;
+          }
         }
         continue;
       }
@@ -1169,6 +1213,7 @@ export class World {
       coins: this.coins,
       inventory: this.inventory,
       nextId: this.nextId,
+      nextWorkerRosterNo: this.nextWorkerRosterNo,
       nextPackId: this.nextPackId,
       nextItemUid: this.nextItemUid,
       selectedId: this.selectedId,
@@ -1195,6 +1240,7 @@ export class World {
         coins?: CoinPurse;
         inventory?: Inventory;
         nextId: number;
+        nextWorkerRosterNo?: number;
         nextPackId?: number;
         nextItemUid?: number;
         selectedId: EntityId | null;
@@ -1211,7 +1257,11 @@ export class World {
       this.worldSeed = data.worldSeed;
       this.tiles = new Map(data.tiles);
       this.loadedChunks = new Set(data.loadedChunks);
-      this.explored = new Set(data.explored);
+      // Force 3D terrain remesh after load
+      this.terrainVersion = this.loadedChunks.size;
+      this.terrainEpoch += 1;
+      // Loaded map is fully known (migrate old walk-fog saves)
+      this.explored = new Set(data.tiles.map(([k]) => k));
       this.stockpile = data.stockpile;
       this.coins = normalizeCoins(data.coins ?? { gold: 0, silver: 0, copper: 0 });
       this.inventory = data.inventory ?? createEmptyInventory();
@@ -1221,6 +1271,7 @@ export class World {
       this.floatTexts = [];
       this.nextFloatId = 1;
       this.nextId = data.nextId;
+      this.nextWorkerRosterNo = data.nextWorkerRosterNo ?? 1;
       this.nextPackId = data.nextPackId ?? 1;
       this.nextItemUid = data.nextItemUid ?? 1;
       this.selectedId = data.selectedId;
@@ -1247,14 +1298,18 @@ export class World {
         };
         if (e.kind === 'worker') {
           const w = withPrev as Worker;
+          // Migrate old saves: assign stable roster numbers by entity id order
+          const rosterNo = w.rosterNo ?? 0;
           this.entities.set(w.id, {
             ...w,
+            rosterNo,
             phase: w.phase ?? 'idle',
             slotIndex: w.slotIndex ?? -1,
             gatherTimer: w.gatherTimer ?? 0,
             carried: w.carried ?? 0,
             carriedResource: w.carriedResource ?? null,
             constructionId: w.constructionId ?? null,
+            foodUpkeepAcc: w.foodUpkeepAcc ?? 0,
           });
         } else if (e.kind === 'resourceNode') {
           const n = withPrev as ResourceNode;
@@ -1278,15 +1333,22 @@ export class World {
             fishingTimer: h.fishingTimer ?? 0,
             fishingNodeId: h.fishingNodeId ?? null,
             combatTimer: h.combatTimer ?? 99,
+            combatLockTicks: h.combatLockTicks ?? 0,
             combatTargetId: h.combatTargetId ?? null,
             queuedTargetId: h.queuedTargetId ?? null,
             fightQueue: h.fightQueue ?? [],
             combatStandX: h.combatStandX ?? null,
             combatStandY: h.combatStandY ?? null,
             combatEngaged: h.combatEngaged ?? false,
+            combatSwingLanded: h.combatSwingLanded ?? false,
+            combatInMelee: h.combatInMelee ?? false,
             combatTurn: h.combatTurn ?? 'hero',
             attackTicks: h.attackTicks ?? CONFIG.heroAttackTicks,
             skills: h.skills ?? createDefaultSkills(),
+            animClip: h.animClip ?? 'idle',
+            animFrame: h.animFrame ?? 0,
+            animFacing: h.animFacing === -1 ? -1 : 1,
+            animHoldTick: false,
           });
         } else if (e.kind === 'enemy') {
           const en = withPrev as Enemy;
@@ -1326,6 +1388,23 @@ export class World {
           this.entities.set(e.id, withPrev as Entity);
         }
       }
+      // Ensure every worker has a rosterNo; old saves used raw entity ids in the UI
+      const workersNeedingNo: Worker[] = [];
+      let maxRoster = 0;
+      for (const ent of this.entities.values()) {
+        if (ent.kind !== 'worker') continue;
+        if (ent.rosterNo > 0) maxRoster = Math.max(maxRoster, ent.rosterNo);
+        else workersNeedingNo.push(ent);
+      }
+      workersNeedingNo.sort((a, b) => a.id - b.id);
+      for (const w of workersNeedingNo) {
+        maxRoster += 1;
+        w.rosterNo = maxRoster;
+      }
+      this.nextWorkerRosterNo = Math.max(
+        data.nextWorkerRosterNo ?? 1,
+        maxRoster + 1,
+      );
       const hero = this.hero();
       if (hero) {
         if (hero.skills) normalizeSkills(hero.skills);

@@ -98,11 +98,14 @@ export class Minimap {
         if (tile && explored) {
           if (tile.terrain === 'water') ctx.fillStyle = '#1a5a9a';
           else if (tile.terrain === 'dirt') ctx.fillStyle = '#7a5a3d';
-          else ctx.fillStyle = '#2f7a52';
+          else if (tile.terrain === 'sand') ctx.fillStyle = '#c2a46a';
+          else if (tile.terrain === 'snow') ctx.fillStyle = '#d0dae6';
+          else ctx.fillStyle = tile.biome === 'forest' ? '#1f5c40' : '#2f7a52';
         } else if (tile) {
-          // Loaded but fogged: still fill so square stays solid
           if (tile.terrain === 'water') ctx.fillStyle = '#0d2840';
           else if (tile.terrain === 'dirt') ctx.fillStyle = '#3a2e22';
+          else if (tile.terrain === 'sand') ctx.fillStyle = '#6a5838';
+          else if (tile.terrain === 'snow') ctx.fillStyle = '#6a7585';
           else ctx.fillStyle = '#1a3326';
         } else {
           // Unloaded cell of this chunk — rare; soft fill
@@ -201,6 +204,8 @@ export class Minimap {
         let water = 0;
         let dirt = 0;
         let grass = 0;
+        let sand = 0;
+        let snow = 0;
         let blocked = 0;
         let n = 0;
         let explored = 0;
@@ -216,6 +221,8 @@ export class Minimap {
             if (t.blocked && t.terrain !== 'water') blocked++;
             if (t.terrain === 'water') water++;
             else if (t.terrain === 'dirt') dirt++;
+            else if (t.terrain === 'sand') sand++;
+            else if (t.terrain === 'snow') snow++;
             else grass++;
           }
         }
@@ -225,15 +232,17 @@ export class Minimap {
           sctx.fillRect(bx, by, 1, 1);
           continue;
         }
-        // Biome mix → richer palette
         let color: string;
-        if (water >= dirt && water >= grass) {
-          const deep = water / n > 0.7;
-          color = deep ? '#1560a0' : '#2a7ec4';
-        } else if (dirt >= grass) {
+        const landMax = Math.max(dirt, grass, sand, snow);
+        if (water >= landMax) {
+          color = water / n > 0.7 ? '#1560a0' : '#2a7ec4';
+        } else if (snow === landMax) {
+          color = '#c8d4e4';
+        } else if (sand === landMax) {
+          color = '#c2a46a';
+        } else if (dirt === landMax) {
           color = blocked > n * 0.25 ? '#6a5038' : '#9a7550';
         } else {
-          // Grass variance from cell position (subtle texture)
           const v = ((gx0 * 17 + gy0 * 31) & 7) / 7;
           color = blocked > n * 0.3 ? '#2d6b45' : v > 0.55 ? '#3d9a5c' : '#348a52';
         }
@@ -281,13 +290,14 @@ export class Minimap {
           const p = toPx(gx, gy);
           if (t.terrain === 'water') ctx.fillStyle = '#1a6eb0';
           else if (t.terrain === 'dirt') ctx.fillStyle = t.blocked ? '#6e533c' : '#a07d56';
-          else ctx.fillStyle = t.blocked ? '#2a6540' : '#3d9a5c';
+          else if (t.terrain === 'sand') ctx.fillStyle = '#d4b87a';
+          else if (t.terrain === 'snow') ctx.fillStyle = '#e8eef6';
+          else ctx.fillStyle = t.blocked ? '#2a6540' : t.biome === 'forest' ? '#2a7a4c' : '#3d9a5c';
           ctx.fillRect(p.x, p.y, cell + 0.4, cell + 0.4);
-          // Decoration as darker dots
-          if (t.decoration === 'tree' || t.decoration === 'fallenTree') {
+          if (t.decoration === 'tree' || t.decoration === 'fallenTree' || t.decoration === 'bush') {
             ctx.fillStyle = '#1f4d2e';
             ctx.fillRect(p.x + cell * 0.25, p.y + cell * 0.2, cell * 0.5, cell * 0.55);
-          } else if (t.decoration === 'stone') {
+          } else if (t.decoration === 'stone' || t.decoration === 'rock') {
             ctx.fillStyle = '#8b949e';
             ctx.fillRect(p.x + cell * 0.3, p.y + cell * 0.3, cell * 0.4, cell * 0.4);
           }

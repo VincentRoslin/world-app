@@ -7,10 +7,18 @@ export type WorkerJob = 'idle' | 'mine' | 'log' | 'farm' | 'build';
 
 /**
  * Where the worker is in their current job loop (see Production.updateWorkerCycle).
- * `waiting` = still has mine/log/farm job but no gatherable node; stands + snores
- * until a node respawns. Distinct from job `idle` (fully unassigned by player).
+ * `waiting`  = job still set, no gatherable node; snore until respawn
+ * `starving` = job still set, stockpile food empty; snore until food returns
+ * Distinct from job `idle` (fully unassigned by player).
  */
-export type WorkerPhase = 'idle' | 'toWork' | 'gathering' | 'toBase' | 'building' | 'waiting';
+export type WorkerPhase =
+  | 'idle'
+  | 'toWork'
+  | 'gathering'
+  | 'toBase'
+  | 'building'
+  | 'waiting'
+  | 'starving';
 
 export type UnitOrder =
   | { type: 'none' }
@@ -36,6 +44,8 @@ export type UnitOrder =
       pathFromY?: number;
     };
 
+export type FloatTextStyle = 'plain' | 'hitsplat' | 'miss';
+
 export interface FloatText {
   id: number;
   x: number;
@@ -44,6 +54,8 @@ export interface FloatText {
   color: string;
   age: number;
   lifetime: number;
+  /** Visual style — hitsplat = combat damage box (OSRS-like). */
+  style?: FloatTextStyle;
 }
 
 export type EntityKind =
@@ -81,8 +93,13 @@ export interface Hero extends BaseEntity {
   attackTicks: number;
   /** Ticks until next attack (integer). */
   attackTimer: number;
-  /** Seconds since last combat event; regen when > grace. */
+  /** Seconds since last combat damage; regen when lock is clear and this > grace. */
   combatTimer: number;
+  /**
+   * Combat lock remaining (game ticks). Set to CONFIG.combatLockTicks on damage
+   * dealt or taken; logout blocked while > 0.
+   */
+  combatLockTicks: number;
   /** Active single combat target (front of fight). */
   combatTargetId: EntityId | null;
   /** Queued next target (player click). */
@@ -95,7 +112,17 @@ export interface Hero extends BaseEntity {
   /** Player still wants this fight (false when fleeing). */
   combatEngaged: boolean;
   /**
-   * Whose swing is next once both are in melee (alternating).
+   * True after the hero has completed at least one swing this fight.
+   * Group-hostile packmates only join once this flips on.
+   */
+  combatSwingLanded: boolean;
+  /**
+   * True while hero + front are in orthogonal melee this tick.
+   * Used so weapon wind-up only counts down in range (paused while walking in).
+   */
+  combatInMelee: boolean;
+  /**
+   * Whose swing is preferred if both weapons are ready the same tick.
    * Hero always opens the exchange.
    */
   combatTurn: 'hero' | 'enemy';
@@ -105,10 +132,29 @@ export interface Hero extends BaseEntity {
   fishingTimer: number;
   /** Active fishing spot, or null. */
   fishingNodeId: EntityId | null;
+  /**
+   * Tick-synced character animation (stepped keyframes, no tweening).
+   * Advanced only on the game tick — see systems/CharacterAnim.ts.
+   */
+  animClip: 'idle' | 'walk' | 'attack';
+  /** Keyframe index within the current clip (walk: 0..1, attack: 0..2). */
+  animFrame: number;
+  /** Screen-space facing snapped on tick: 1 = right, -1 = left. */
+  animFacing: 1 | -1;
+  /**
+   * When true, CharacterAnim will not advance the attack clip this tick
+   * (set the same tick combat starts the contact frame).
+   */
+  animHoldTick: boolean;
 }
 
 export interface Worker extends BaseEntity {
   kind: 'worker';
+  /**
+   * Human-facing roster number (#1, #2, …), not the global entity id.
+   * Entity ids are shared with base/nodes/hero so the first workers are not #1.
+   */
+  rosterNo: number;
   speed: number;
   job: WorkerJob;
   phase: WorkerPhase;
@@ -121,6 +167,11 @@ export interface Worker extends BaseEntity {
   carried: number;
   carriedResource: ResourceKind | null;
   constructionId: EntityId | null;
+  /**
+   * Accrues real time toward the next food upkeep tick while job !== idle.
+   * Stage 1 economy: working workers consume stockpile food.
+   */
+  foodUpkeepAcc: number;
   order: UnitOrder;
 }
 
@@ -139,10 +190,14 @@ export interface Enemy extends BaseEntity {
   defenseLevel: number;
   order: UnitOrder;
   aggressive: boolean;
-  /** Returning to camp after leash break. */
+  /**
+   * Returning to exact spawn after leash break.
+   * While true: no target, ignore player proximity (except touch re-aggro inside leash).
+   */
   leashing: boolean;
   fightRole: FightRole;
   queueIndex: number;
+  /** Exact spawn / camp position (leash origin + walk-home target). */
   campX: number;
   campY: number;
   packId: number;
@@ -219,13 +274,19 @@ export type Entity =
   | ResourceNode
   | LootPile;
 
-export type TileTerrain = 'grass' | 'dirt' | 'water';
+/** Surface type for rendering + walk rules. Water is blocked unless a bridge. */
+export type TileTerrain = 'grass' | 'dirt' | 'water' | 'sand' | 'snow';
+
+/** Large-scale map region (drives palette + décor density). */
+export type BiomeId = 'meadow' | 'forest' | 'arid';
 
 export interface Tile {
   terrain: TileTerrain;
   blocked: boolean;
   /** Visual-only scenery; it does not affect pathing or resource gathering. */
-  decoration?: 'tree' | 'fallenTree' | 'stone';
+  decoration?: 'tree' | 'fallenTree' | 'stone' | 'bush' | 'rock';
+  /** Optional biome tag for debugging / future systems. */
+  biome?: BiomeId;
 }
 
 export interface Stockpile {

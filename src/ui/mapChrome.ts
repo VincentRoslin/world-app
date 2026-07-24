@@ -26,6 +26,7 @@ export class MapChrome {
   private dragging = false;
   private lastPtrX = 0;
   private lastPtrY = 0;
+  private coordsEl: HTMLElement | null = null;
 
   constructor(world: World, miniCanvas: HTMLCanvasElement, fullCanvas: HTMLCanvasElement) {
     this.world = world;
@@ -35,6 +36,7 @@ export class MapChrome {
     this.wrap = document.getElementById('minimap-wrap')!;
     this.tray = document.getElementById('minimap-tray')!;
     this.overlay = document.getElementById('map-overlay')!;
+    this.coordsEl = document.getElementById('map-tile-coords');
 
     document.getElementById('btn-minimap-min')?.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -219,6 +221,7 @@ export class MapChrome {
   }
 
   render(): void {
+    this.updateTileCoords();
     if (this.mode === 'normal') {
       this.mini.render(this.world, 'local');
     } else if (this.mode === 'expanded') {
@@ -229,6 +232,22 @@ export class MapChrome {
       }
       this.full.render(this.world, 'world', this.cam);
     }
+  }
+
+  /** Live world tile under cursor — handy for debugging map fixes. */
+  private updateTileCoords(): void {
+    if (!this.coordsEl) return;
+    const h = this.world.hoverTile;
+    if (!h) {
+      this.coordsEl.textContent = '—';
+      this.coordsEl.title = 'Tile under cursor (world X, Y)';
+      return;
+    }
+    this.coordsEl.textContent = `${h.gx}, ${h.gy}`;
+    const tile = this.world.tileAt(h.gx, h.gy);
+    const biome = tile?.biome ? ` · ${tile.biome}` : '';
+    const terr = tile?.terrain ? ` · ${tile.terrain}` : '';
+    this.coordsEl.title = `Tile ${h.gx}, ${h.gy}${terr}${biome}`;
   }
 }
 

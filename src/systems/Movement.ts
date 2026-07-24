@@ -6,6 +6,9 @@ import type { World } from '../world/World';
 
 type Mover = Extract<Entity, { order: UnitOrder; speed: number }>;
 
+/** How close to a tile center before we snap and take the next path cell. */
+const TILE_ARRIVE = 0.06;
+
 function walk(world: World) {
   return (gx: number, gy: number) => world.isWalkable(gx, gy);
 }
@@ -20,18 +23,36 @@ function effectiveSpeed(unit: Mover): number {
   return unit.speed;
 }
 
-/** Straight-line step toward a world point (simple routing — no multi-sample steer). */
+/** Grid path: A* octile costs, prefer dirt roads, tile-center steps (no string-pull). */
+function pathOnGrid(
+  world: World,
+  sx: number,
+  sy: number,
+  tx: number,
+  ty: number,
+): { x: number; y: number }[] {
+  return findPath(walk(world), sx, sy, tx, ty, 6000, {
+    smooth: false,
+    cost: (x, y) => world.pathCost(x, y),
+  });
+}
+
+function tileCenter(gx: number, gy: number): { x: number; y: number } {
+  return { x: gx + 0.5, y: gy + 0.5 };
+}
+
+/**
+ * Move toward a point, but only along the line to it (used for finishing a tile).
+ * Prefer followPath for multi-tile routes.
+ */
 function stepToward(world: World, unit: Mover, tx: number, ty: number, step: number): void {
   const d = dist(unit.x, unit.y, tx, ty);
-  let nx = unit.x;
-  let ny = unit.y;
   if (d <= step || d < 1e-6) {
-    nx = tx;
-    ny = ty;
-  } else {
-    nx = unit.x + ((tx - unit.x) / d) * step;
-    ny = unit.y + ((ty - unit.y) / d) * step;
+    applyPosition(world, unit, tx, ty);
+    return;
   }
+  const nx = unit.x + ((tx - unit.x) / d) * step;
+  const ny = unit.y + ((ty - unit.y) / d) * step;
   applyPosition(world, unit, nx, ny);
 }
 
@@ -45,6 +66,7 @@ function applyPosition(world: World, unit: Mover, nx: number, ny: number): void 
     return;
   }
 
+  // Axis slide if diagonal step blocked
   if (world.isWalkable(Math.floor(nx), Math.floor(oy))) unit.x = nx;
   if (world.isWalkable(Math.floor(unit.x), Math.floor(ny))) unit.y = ny;
 
@@ -65,6 +87,11 @@ function applyPosition(world: World, unit: Mover, nx: number, ny: number): void 
 
 function setMoveOrder(world: World, unit: Mover, tx: number, ty: number): void {
   const from = floorTile(unit.x, unit.y);
+  // Start every route from the current tile center so steps are pure center→center.
+  const start = tileCenter(from.gx, from.gy);
+  unit.x = start.x;
+  unit.y = start.y;
+
   let goalX = tx;
   let goalY = ty;
   if (!world.isWalkable(tx, ty)) {
@@ -77,10 +104,10 @@ function setMoveOrder(world: World, unit: Mover, tx: number, ty: number): void {
     return;
   }
   if (from.gx === goalX && from.gy === goalY) {
-    unit.order = { type: 'move', tx: goalX, ty: goalY, path: [] };
+    unit.order = { type: 'none' };
     return;
   }
-  const path = findPath(walk(world), from.gx, from.gy, goalX, goalY);
+  const path = pathOnGrid(world, from.gx, from.gy, goalX, goalY);
   unit.order = { type: 'move', tx: goalX, ty: goalY, path };
 }
 
@@ -97,11 +124,12 @@ export function issueGather(unit: Mover, nodeId: number): void {
 }
 
 /**
- * Continuous movement every frame.
+ * Tile-locked movement for hero, workers, and enemies.
  *
- * Routing is intentionally simple again (grid path → tile centers → step):
- * crowded farm jams are eased by spacing resource nodes (see MapGen /
- * nodeMinSeparation), not by aggressive local dodge that made workers spin.
+ * - A* / BFS builds a chain of tiles (8-dir, diagonal OK as one tile step).
+ * - Units walk center → center; snap when arriving so they never drift off-grid.
+ * - No path string-pull (that was the “fluid free glide” look).
+ * - Separation is light and skipped while mid-path so it doesn’t shove units off tiles.
  */
 export function updateMovement(world: World, dt: number): void {
   for (const e of world.entities.values()) {
@@ -144,9 +172,17 @@ function heroMoveDir(hero: Extract<Entity, { kind: 'hero' }>): { x: number; y: n
   return { x: dx / len, y: dy / len };
 }
 
+function isActivelyPathing(unit: Mover): boolean {
+  const o = unit.order;
+  if (o.type === 'move' && o.path.length > 0) return true;
+  if (o.type === 'gather' && o.path && o.path.length > 0) return true;
+  if (o.type === 'attack' && o.path && o.path.length > 0) return true;
+  return false;
+}
+
 /**
- * Soft separation only — light touch so units don't stack, without fighting
- * the path follower (which was the spin source).
+ * Soft separation — skipped for units mid tile-path so they stay on rails.
+ * Gathering / waiting / starving workers stay planted.
  */
 function applySeparation(world: World, dt: number): void {
   const units: Mover[] = [];
@@ -158,16 +194,21 @@ function applySeparation(world: World, dt: number): void {
   }
   const r = CONFIG.unitRadius;
   const r2 = (r * 2) ** 2;
-  const strength = CONFIG.separationStrength * dt;
-  const maxStep = CONFIG.separationMaxSpeed * dt;
+  const strength = CONFIG.separationStrength * dt * 0.55; // lighter — less drift off tiles
+  const maxStep = CONFIG.separationMaxSpeed * dt * 0.55;
   const lateralBias = CONFIG.separationLateralBias;
 
   for (let i = 0; i < units.length; i++) {
     const a = units[i]!;
     if (a.kind === 'hero') continue;
-    // Gathering workers stay planted so their gather timer isn't interrupted
     if (a.kind === 'worker' && a.phase === 'gathering') continue;
-    if (a.kind === 'worker' && (a.phase === 'waiting' || a.phase === 'building')) continue;
+    if (
+      a.kind === 'worker' &&
+      (a.phase === 'waiting' || a.phase === 'starving' || a.phase === 'building')
+    )
+      continue;
+    // Stay on tile path — don't shove pathing units sideways off-center
+    if (isActivelyPathing(a)) continue;
 
     let fx = 0;
     let fy = 0;
@@ -202,7 +243,6 @@ function applySeparation(world: World, dt: number): void {
 
     if (fx === 0 && fy === 0) continue;
 
-    // Hero walk-through: workers glide sideways instead of being shoved along the path
     if (pushedByHero && a.kind === 'worker') {
       const hspd = Math.hypot(heroVx, heroVy);
       if (hspd > 1e-5) {
@@ -249,8 +289,9 @@ function stepUnit(world: World, unit: Mover, dt: number): void {
     const dy = Math.abs(from.gy - to.gy);
     const inMelee = (dx === 1 && dy === 0) || (dx === 0 && dy === 1);
     if (inMelee) {
-      unit.x = from.gx + 0.5;
-      unit.y = from.gy + 0.5;
+      const c = tileCenter(from.gx, from.gy);
+      unit.x = c.x;
+      unit.y = c.y;
       order.path = [];
       return;
     }
@@ -298,7 +339,7 @@ function stepUnit(world: World, unit: Mover, dt: number): void {
       order.pathFromY !== from.gy ||
       (order.path[0] != null && !w(order.path[0].x, order.path[0].y));
     if (needRepath) {
-      order.path = findPath(w, from.gx, from.gy, goalX, goalY);
+      order.path = pathOnGrid(world, from.gx, from.gy, goalX, goalY);
       order.pathGoalX = goalX;
       order.pathGoalY = goalY;
       order.pathFromX = from.gx;
@@ -310,7 +351,8 @@ function stepUnit(world: World, unit: Mover, dt: number): void {
       order.pathFromX = nf.gx;
       order.pathFromY = nf.gy;
     } else {
-      stepToward(world, unit, goalX + 0.5, goalY + 0.5, speed * dt);
+      const c = tileCenter(goalX, goalY);
+      stepToward(world, unit, c.x, c.y, speed * dt);
     }
     return;
   }
@@ -351,22 +393,21 @@ function stepUnit(world: World, unit: Mover, dt: number): void {
       ty = adj.y + 0.5;
     }
 
-    const dSlot = dist(unit.x, unit.y, tx, ty);
-    if (dSlot <= CONFIG.gatherReach) {
-      applyPosition(world, unit, tx, ty);
-      return;
-    }
-
-    const step = speed * dt;
-    if (dSlot <= CONFIG.gatherApproach) {
-      stepToward(world, unit, tx, ty, step);
-      return;
-    }
-
-    const from = floorTile(unit.x, unit.y);
     const goalX = Math.floor(tx);
     const goalY = Math.floor(ty);
-    // Cache path while tile-to-tile goal is stable (avoids repath thrash)
+    const from = floorTile(unit.x, unit.y);
+
+    // On the stand tile — snap to exact stand point (tile center / slot)
+    if (from.gx === goalX && from.gy === goalY) {
+      if (dist(unit.x, unit.y, tx, ty) <= CONFIG.gatherReach) {
+        unit.x = tx;
+        unit.y = ty;
+        return;
+      }
+      stepToward(world, unit, tx, ty, speed * dt);
+      return;
+    }
+
     const needRepath =
       !order.path ||
       order.path.length === 0 ||
@@ -376,7 +417,7 @@ function stepUnit(world: World, unit: Mover, dt: number): void {
       order.pathFromY !== from.gy ||
       (order.path[0] != null && !w(order.path[0].x, order.path[0].y));
     if (needRepath) {
-      order.path = findPath(w, from.gx, from.gy, goalX, goalY);
+      order.path = pathOnGrid(world, from.gx, from.gy, goalX, goalY);
       order.pathGoalX = goalX;
       order.pathGoalY = goalY;
       order.pathFromX = from.gx;
@@ -388,7 +429,8 @@ function stepUnit(world: World, unit: Mover, dt: number): void {
       order.pathFromX = nf.gx;
       order.pathFromY = nf.gy;
     } else {
-      stepToward(world, unit, tx, ty, step);
+      const c = tileCenter(goalX, goalY);
+      stepToward(world, unit, c.x, c.y, speed * dt);
     }
     return;
   }
@@ -397,11 +439,12 @@ function stepUnit(world: World, unit: Mover, dt: number): void {
     if (order.path.length === 0) {
       const from = floorTile(unit.x, unit.y);
       if (from.gx === order.tx && from.gy === order.ty) {
-        const cx = order.tx + 0.5;
-        const cy = order.ty + 0.5;
-        if (dist(unit.x, unit.y, cx, cy) > 0.08) {
-          stepToward(world, unit, cx, cy, speed * dt);
+        const c = tileCenter(order.tx, order.ty);
+        if (dist(unit.x, unit.y, c.x, c.y) > TILE_ARRIVE) {
+          stepToward(world, unit, c.x, c.y, speed * dt);
         } else {
+          unit.x = c.x;
+          unit.y = c.y;
           unit.order = { type: 'none' };
         }
         return;
@@ -410,15 +453,16 @@ function stepUnit(world: World, unit: Mover, dt: number): void {
         unit.order = { type: 'none' };
         return;
       }
-      const path = findPath(w, from.gx, from.gy, order.tx, order.ty);
+      const path = pathOnGrid(world, from.gx, from.gy, order.tx, order.ty);
       if (path.length > 0) {
         order.path = path;
       } else {
-        const goalX = order.tx + 0.5;
-        const goalY = order.ty + 0.5;
-        if (dist(unit.x, unit.y, goalX, goalY) > 0.12) {
-          stepToward(world, unit, goalX, goalY, speed * dt);
+        const c = tileCenter(order.tx, order.ty);
+        if (dist(unit.x, unit.y, c.x, c.y) > TILE_ARRIVE) {
+          stepToward(world, unit, c.x, c.y, speed * dt);
         } else {
+          unit.x = c.x;
+          unit.y = c.y;
           unit.order = { type: 'none' };
         }
         return;
@@ -427,14 +471,18 @@ function stepUnit(world: World, unit: Mover, dt: number): void {
       const next = order.path[0]!;
       if (!world.isWalkable(next.x, next.y)) {
         const from = floorTile(unit.x, unit.y);
-        order.path = findPath(w, from.gx, from.gy, order.tx, order.ty);
+        order.path = pathOnGrid(world, from.gx, from.gy, order.tx, order.ty);
       }
     }
     followPath(world, unit, order.path, dt, speed);
   }
 }
 
-/** Follow grid path via tile centers (classic routing). */
+/**
+ * Walk path tile-by-tile: always aim at the **center** of the next path cell.
+ * Snap on arrive so the unit sits on the grid before the next step (incl. diagonals).
+ * Leftover move budget carries into the next tile so speed stays honest without free gliding.
+ */
 function followPath(
   world: World,
   unit: Mover,
@@ -444,28 +492,36 @@ function followPath(
 ): void {
   if (path.length === 0) return;
 
-  while (path.length > 0 && !world.isWalkable(path[0]!.x, path[0]!.y)) {
-    path.shift();
-  }
-  if (path.length === 0) return;
+  let budget = speed * dt;
+  // Cap how many tiles we can clear in one frame (avoids teleporting on lag spikes).
+  let hops = 0;
+  const maxHops = 4;
 
-  const waypoint = path[0]!;
-  const tx = waypoint.x + 0.5;
-  const ty = waypoint.y + 0.5;
-  const d = dist(unit.x, unit.y, tx, ty);
-  const step = speed * dt;
+  while (path.length > 0 && budget > 0 && hops < maxHops) {
+    while (path.length > 0 && !world.isWalkable(path[0]!.x, path[0]!.y)) {
+      path.shift();
+    }
+    if (path.length === 0) return;
 
-  if (d < 0.22 && path.length > 1) {
-    path.shift();
-    return;
-  }
+    const waypoint = path[0]!;
+    const tx = waypoint.x + 0.5;
+    const ty = waypoint.y + 0.5;
+    const d = dist(unit.x, unit.y, tx, ty);
 
-  if (d <= step) {
-    applyPosition(world, unit, tx, ty);
-    path.shift();
-  } else {
-    const nx = unit.x + ((tx - unit.x) / d) * step;
-    const ny = unit.y + ((ty - unit.y) / d) * step;
+    if (d <= budget || d <= TILE_ARRIVE) {
+      // Hard snap to tile center — locked to the grid (ortho or diagonal step).
+      unit.x = tx;
+      unit.y = ty;
+      path.shift();
+      budget = Math.max(0, budget - d);
+      hops++;
+      continue;
+    }
+
+    // Move only toward this tile’s center (no free cut toward a far goal).
+    const nx = unit.x + ((tx - unit.x) / d) * budget;
+    const ny = unit.y + ((ty - unit.y) / d) * budget;
     applyPosition(world, unit, nx, ny);
+    return;
   }
 }

@@ -203,25 +203,70 @@ export function drawGroundHighlight(
   ctx.restore();
 }
 
-/** Unit selection: small stable ring under feet (not a hover glow). */
+/** Unit selection: yellow-ish diamond under feet (tactical “you” marker). */
 export function drawUnitSelectRing(
   ctx: CanvasRenderingContext2D,
   foot: { x: number; y: number },
 ): void {
   const { tileW, tileH } = CONFIG;
-  const w = tileW * 0.7;
-  const h = tileH * 0.7;
+  const w = tileW * 0.78;
+  const h = tileH * 0.78;
   ctx.save();
-  ctx.strokeStyle = HL.select;
-  ctx.lineWidth = 2.75;
-  ctx.lineJoin = 'round';
-  ctx.globalAlpha = 0.95;
+  // Fill wash
+  ctx.globalAlpha = 0.18;
+  ctx.fillStyle = HL.select;
   ctx.beginPath();
   ctx.moveTo(foot.x, foot.y - h / 2);
   ctx.lineTo(foot.x + w / 2, foot.y);
   ctx.lineTo(foot.x, foot.y + h / 2);
   ctx.lineTo(foot.x - w / 2, foot.y);
   ctx.closePath();
+  ctx.fill();
+  // Hard outer ring
+  ctx.globalAlpha = 0.95;
+  ctx.strokeStyle = HL.select;
+  ctx.lineWidth = 2.5;
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+  // Inner hairline
+  ctx.globalAlpha = 0.55;
+  ctx.lineWidth = 1;
+  const iw = w * 0.72;
+  const ih = h * 0.72;
+  ctx.beginPath();
+  ctx.moveTo(foot.x, foot.y - ih / 2);
+  ctx.lineTo(foot.x + iw / 2, foot.y);
+  ctx.lineTo(foot.x, foot.y + ih / 2);
+  ctx.lineTo(foot.x - iw / 2, foot.y);
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
+/** Red/yellow combat click-circle under a fight target. */
+export function drawCombatGroundRing(
+  ctx: CanvasRenderingContext2D,
+  foot: { x: number; y: number },
+  accent: string,
+  scale = 0.88,
+): void {
+  const { tileW, tileH } = CONFIG;
+  const w = tileW * scale;
+  const h = tileH * scale;
+  ctx.save();
+  ctx.globalAlpha = 0.2;
+  ctx.fillStyle = accent;
+  ctx.beginPath();
+  ctx.moveTo(foot.x, foot.y - h / 2);
+  ctx.lineTo(foot.x + w / 2, foot.y);
+  ctx.lineTo(foot.x, foot.y + h / 2);
+  ctx.lineTo(foot.x - w / 2, foot.y);
+  ctx.closePath();
+  ctx.fill();
+  ctx.globalAlpha = 0.95;
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 2.75;
+  ctx.lineJoin = 'round';
   ctx.stroke();
   ctx.restore();
 }
@@ -241,28 +286,39 @@ export function drawHoverLabel(
   if (alpha <= 0.02 || !text) return;
   const a = Math.max(0, Math.min(1, alpha));
   ctx.save();
-  ctx.font = '600 12px system-ui, sans-serif';
+  ctx.font = '600 13px system-ui, sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  const padX = 8;
+  const padX = 10;
   const tw = ctx.measureText(text).width;
   const bw = tw + padX * 2;
-  const bh = 18;
+  const bh = 22;
   const x = screenX;
   const y = screenY - 8;
   const left = x - bw / 2;
   const top = y - bh / 2;
 
-  ctx.globalAlpha = 0.88 * a;
-  ctx.fillStyle = 'rgba(13, 17, 23, 0.88)';
+  // Soft drop shadow
+  ctx.globalAlpha = 0.35 * a;
+  ctx.fillStyle = '#000000';
+  roundRect(ctx, left + 1, top + 2, bw, bh, 7);
+  ctx.fill();
+
+  ctx.globalAlpha = 0.92 * a;
+  ctx.fillStyle = 'rgba(13, 17, 23, 0.92)';
   ctx.strokeStyle = accent;
-  ctx.lineWidth = 1.5;
-  roundRect(ctx, left, top, bw, bh, 6);
+  ctx.lineWidth = 2;
+  roundRect(ctx, left, top, bw, bh, 7);
   ctx.fill();
   ctx.stroke();
 
+  // Accent underline bar
+  ctx.globalAlpha = 0.85 * a;
+  ctx.fillStyle = accent;
+  ctx.fillRect(left + 6, top + bh - 3, bw - 12, 2);
+
   ctx.globalAlpha = a;
-  ctx.fillStyle = '#e6edf3';
+  ctx.fillStyle = '#f0f3f6';
   ctx.fillText(text, x, y + 0.5);
   ctx.restore();
 }
@@ -288,7 +344,8 @@ function roundRect(
 /** Label vertical offset above sprite (screen space, pre-zoom world units converted by caller). */
 export function labelAnchorY(e: Entity, bodyY: number): number {
   if (e.kind === 'base' || e.kind === 'blacksmith') return bodyY - 52;
-  if (e.kind === 'npc' || e.kind === 'hero') return bodyY - 36;
+  if (e.kind === 'hero') return bodyY - 42;
+  if (e.kind === 'npc') return bodyY - 36;
   if (e.kind === 'enemy') return bodyY - 32;
   if (e.kind === 'worker') return bodyY - 28;
   if (e.kind === 'resourceNode') return bodyY - 36;

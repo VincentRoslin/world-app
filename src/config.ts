@@ -14,14 +14,38 @@
 export const CONFIG = {
   /** Tiles per chunk side (32 balances vision streaming vs content density). */
   chunkSize: 32,
-  visionRadius: 8,
+  /**
+   * Chunk streaming still uses a hero-centric load radius (not fog).
+   * Kept as a general “near hero” distance for systems that need it.
+   */
+  visionRadius: 14,
+  /**
+   * Max world-tile distance the camera look-at may stray from the hero
+   * when free-panning (WASD / drag). Prevents scrolling across the whole map.
+   * Dev “Unlock cam” bypasses this.
+   */
+  cameraLeashTiles: 18,
   /** Soft cap: how far from home (in chunks) can generate. */
   maxChunkRadius: 8,
 
   tileW: 64,
   /** Slightly flatter than classic 2:1 → camera a bit more top-down. */
   tileH: 28,
-  defaultZoom: 0.88,
+  /**
+   * Camera zoom (screen scale). Hard clamps keep the viewport OSRS-like:
+   * open world by walking, but you never pull the camera so far that the GPU
+   * tries to paint half the map. Min ≈ “max zoom out”, max ≈ “close-up”.
+   */
+  defaultZoom: 0.92,
+  minZoom: 0.74,
+  maxZoom: 1.55,
+  /**
+   * Safety: even if zoom were forced lower, never iterate more than this many
+   * tiles on the wider axis of the view (cull + performance belt).
+   */
+  maxViewTilesWide: 52,
+  /** Skip grass tufts / light décor when zoomed out past this (cheap LOD). */
+  decorationMinZoom: 0.82,
   /**
    * Screen-space Y nudge for *standing* units (hero, worker, props with height).
    * Positive = toward bottom of screen (iso "south").
@@ -47,22 +71,43 @@ export const CONFIG = {
   startWood: 50,
   startFood: 100,
 
+  /**
+   * Worker cap: base + upgradeLevel * perLevel, hard-capped at maxWorkers.
+   * Stage 2: growth unlocks more workforce (not free infinite trains).
+   */
   maxWorkers: 12,
+  maxWorkersBase: 6,
+  maxWorkersPerBaseLevel: 2,
+
+  /** Train worker base cost; scaled by current workforce (see workerTrainCost). */
   workerTrainStone: 25,
   workerTrainFood: 50,
+  /**
+   * Extra mult per existing worker (incl. train queue): cost *= 1 + scale * count.
+   * count=2 → 1.8×; count=4 → 2.6× — 2nd/3rd worker is felt.
+   */
+  workerTrainScalePerWorker: 0.4,
   workerTrainTime: 3,
   blacksmithBuildSeconds: 300,
 
-  /** Base upgrade: cost and build time (per builder). */
+  /** Base upgrade base cost for level 0→1; scales with current upgradeLevel. */
   baseUpgradeStone: 100,
   baseUpgradeWood: 80,
   baseUpgradeFood: 50,
+  /** cost *= 1 + scale * upgradeLevel (level 1→2 is 1.55× base, etc.). */
+  baseUpgradeScalePerLevel: 0.55,
   baseUpgradeSeconds: 180,
   baseMaxLevel: 3,
 
   /** Seconds gathering at a node before returning to base to deposit. */
   resourceTickInterval: 15,
   gatherAmount: 3,
+  /**
+   * Stage 1 economy — food upkeep for workers with a job (not idle).
+   * 1 food / 15s / worker ≈ one farmer (+3/15s) supports ~3 workers at net zero.
+   */
+  workerFoodUpkeepInterval: 15,
+  workerFoodUpkeepAmount: 1,
   /** How close (tile units) a worker must be to their work slot. */
   gatherReach: 0.28,
   /** When within this of the slot, skip grid path and walk straight in. */
@@ -122,15 +167,31 @@ export const CONFIG = {
   heroHp: 10,
   /** Unused flat damage — combat uses skills + gear bonuses. */
   heroDamage: 1,
-  /** Weapon speed in game ticks (4 × 0.6s = 2.4s). */
+  /**
+   * Weapon speed in game ticks between swings (while in melee).
+   * 4 × gameTickSec (0.6s) = 2.4s per attack for hero and most mobs.
+   */
   heroAttackTicks: 4,
   heroRange: 1.25,
   /** Out-of-combat HP regeneration. */
   heroHpRegenPerSec: 1,
-  /** Seconds after combat before regen starts. */
+  /** Seconds after combat lock ends before regen starts. */
   heroCombatGrace: 3,
-  /** Game tick length (server cycle). */
+  /**
+   * Player combat lock (game ticks). Set/refreshed when dealing or taking damage.
+   * Counts down 1 per game tick; logout blocked while > 0.
+   */
+  combatLockTicks: 16,
+  /** Game tick length (server cycle) — also the character animation heartbeat. */
   gameTickSec: 0.6,
+  /**
+   * Hero visual animation (tick-synced, stepped keyframes — no tweening).
+   * Walk: 2 poses flip each game tick while pathing.
+   * Attack: 3 poses over 3 ticks (ready → contact → recover).
+   */
+  /** Walk poses: 0 plant L, 1 mid, 2 plant R, 3 mid (mechanical stride). */
+  charWalkFrames: 4,
+  charAttackFrames: 3,
   /** Walk = 1 tile/tick; run = 2 tiles/tick. */
   walkTilesPerTick: 1,
   runTilesPerTick: 2,
@@ -142,11 +203,11 @@ export const CONFIG = {
   /** Max ticks processed in one frame (avoids spiral of death after tab-out). */
   maxTicksPerFrame: 3,
   /**
-   * Max tiles from enemy camp for combat leash.
-   * Inside: front chases if you kite; stand still → hero re-engages.
-   * Outside: fight ends and mobs return home.
+   * Max tiles from spawn (camp) an aggressive NPC may be pulled.
+   * Beyond this: instantly lose target, ignore player proximity, walk home.
+   * Touch / player-attack re-aggro only applies while still inside this radius.
    */
-  enemyLeashDistance: 10,
+  enemyLeashDistance: 7,
   /** Auto-retarget / fight group radius. */
   heroAutoTargetRange: 8,
   /** Packmates within this range join the fight queue. */
@@ -185,7 +246,14 @@ export const CONFIG = {
   saveKey: 'iso-base-save-v12',
 } as const;
 
-/** Per-species starter combat stats (easy). */
+/**
+ * Per-species starter combat stats.
+ *
+ * groupHostile:
+ *   true  — packmates (same packId, within fightGroupRadius) join the fight
+ *           queue **after the hero’s first swing lands** (not on click/approach).
+ *   false — 1v1 only; other animals ignore the scrap.
+ */
 export const ENEMY_SPECIES = {
   cow: {
     name: 'Cow',
@@ -195,6 +263,7 @@ export const ENEMY_SPECIES = {
     defenseLevel: 1,
     color: '#e6edf3',
     aggroRadius: 0, // passive until attacked
+    groupHostile: false,
   },
   goblin: {
     name: 'Goblin',
@@ -203,7 +272,8 @@ export const ENEMY_SPECIES = {
     attackTicks: 4,
     defenseLevel: 1,
     color: '#3fb950',
-    aggroRadius: 0, // only when attacked — no passive join
+    aggroRadius: 0, // only when attacked
+    groupHostile: true,
   },
   human: {
     name: 'Human',
@@ -213,6 +283,7 @@ export const ENEMY_SPECIES = {
     defenseLevel: 1,
     color: '#f0c6a8',
     aggroRadius: 0,
+    groupHostile: true,
   },
 } as const;
 

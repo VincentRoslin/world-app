@@ -18,6 +18,18 @@ export const DIRS8: readonly { x: number; y: number }[] = [
   { x: -1, y: 1 },
 ];
 
+/** Step length: ortho = 1, diagonal = √2 (octile metric). */
+function stepLen(dx: number, dy: number): number {
+  return dx !== 0 && dy !== 0 ? Math.SQRT2 : 1;
+}
+
+/** Octile distance heuristic (consistent with 8-dir movement). */
+function octile(ax: number, ay: number, bx: number, by: number): number {
+  const dx = Math.abs(ax - bx);
+  const dy = Math.abs(ay - by);
+  return Math.max(dx, dy) + (Math.SQRT2 - 1) * Math.min(dx, dy);
+}
+
 function canStep(walkable: WalkFn, x: number, y: number, dx: number, dy: number): boolean {
   const nx = x + dx;
   const ny = y + dy;
@@ -93,9 +105,15 @@ export function smoothPath(
   return out;
 }
 
+export type PathCostFn = (x: number, y: number) => number;
+
 /**
- * 8-direction BFS with corner rules + string-pull smooth.
- * Returns path excluding start, including goal.
+ * 8-direction A* (orthogonal + diagonal, no corner-cutting).
+ * Returns path excluding start, including goal — **one entry per tile**.
+ *
+ * - Uses octile costs so diagonals are preferred when they actually shorten travel.
+ * - Optional per-tile cost multiplier (e.g. prefer dirt paths over rough ground).
+ * - Default does not string-pull (tile-center → tile-center movement).
  */
 export function findPath(
   walkable: WalkFn,
@@ -104,49 +122,134 @@ export function findPath(
   tx: number,
   ty: number,
   maxNodes = 4000,
+  opts?: { smooth?: boolean; cost?: PathCostFn },
 ): { x: number; y: number }[] {
   if (!walkable(sx, sy)) return [];
   if (sx === tx && sy === ty) return [];
-  // If goal not walkable, path to nearest approach via adjacent search at end
+
   const goalWalkable = walkable(tx, ty);
+  const costAt = opts?.cost ?? (() => 1);
 
   const startKey = `${sx},${sy}`;
   const goalKey = `${tx},${ty}`;
-  const queue: { x: number; y: number }[] = [{ x: sx, y: sy }];
-  let head = 0;
+
+  // gScore / fScore
+  const gScore = new Map<string, number>();
+  gScore.set(startKey, 0);
+
+  // Simple binary min-heap on f
+  const openX: number[] = [sx];
+  const openY: number[] = [sy];
+  const openF: number[] = [octile(sx, sy, tx, ty)];
+  const inOpen = new Set<string>([startKey]);
   const came = new Map<string, string | null>();
   came.set(startKey, null);
+  const closed = new Set<string>();
+
+  const heapPush = (x: number, y: number, f: number) => {
+    openX.push(x);
+    openY.push(y);
+    openF.push(f);
+    let i = openF.length - 1;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (openF[p]! <= openF[i]!) break;
+      const tf = openF[p]!;
+      openF[p] = openF[i]!;
+      openF[i] = tf;
+      const tx0 = openX[p]!;
+      openX[p] = openX[i]!;
+      openX[i] = tx0;
+      const ty0 = openY[p]!;
+      openY[p] = openY[i]!;
+      openY[i] = ty0;
+      i = p;
+    }
+  };
+
+  const heapPop = (): { x: number; y: number } | null => {
+    const n = openF.length;
+    if (n === 0) return null;
+    const x = openX[0]!;
+    const y = openY[0]!;
+    const lx = openX.pop()!;
+    const ly = openY.pop()!;
+    const lf = openF.pop()!;
+    if (openF.length > 0) {
+      openX[0] = lx;
+      openY[0] = ly;
+      openF[0] = lf;
+      let i = 0;
+      for (;;) {
+        const l = i * 2 + 1;
+        const r = l + 1;
+        let smallest = i;
+        if (l < openF.length && openF[l]! < openF[smallest]!) smallest = l;
+        if (r < openF.length && openF[r]! < openF[smallest]!) smallest = r;
+        if (smallest === i) break;
+        const tf = openF[i]!;
+        openF[i] = openF[smallest]!;
+        openF[smallest] = tf;
+        const tx0 = openX[i]!;
+        openX[i] = openX[smallest]!;
+        openX[smallest] = tx0;
+        const ty0 = openY[i]!;
+        openY[i] = openY[smallest]!;
+        openY[smallest] = ty0;
+        i = smallest;
+      }
+    }
+    return { x, y };
+  };
 
   let endKey: string | null = null;
   let visited = 0;
 
-  while (head < queue.length && visited < maxNodes) {
-    const cur = queue[head]!;
-    head++;
-    visited++;
+  while (openF.length > 0 && visited < maxNodes) {
+    const cur = heapPop()!;
     const key = `${cur.x},${cur.y}`;
+    if (closed.has(key)) continue;
+    closed.add(key);
+    inOpen.delete(key);
+    visited++;
+
     if (goalWalkable && key === goalKey) {
       endKey = key;
       break;
     }
+
+    const gCur = gScore.get(key) ?? Infinity;
 
     for (const d of DIRS8) {
       if (!canStep(walkable, cur.x, cur.y, d.x, d.y)) continue;
       const nx = cur.x + d.x;
       const ny = cur.y + d.y;
       const nKey = `${nx},${ny}`;
-      if (came.has(nKey)) continue;
+      if (closed.has(nKey)) continue;
+
+      const terrain = costAt(nx, ny);
+      if (!(terrain > 0) || !Number.isFinite(terrain)) continue;
+
+      const stepCost = stepLen(d.x, d.y) * terrain;
+      const tentative = gCur + stepCost;
+      const prevG = gScore.get(nKey);
+      if (prevG !== undefined && tentative >= prevG) continue;
+
       came.set(nKey, key);
-      queue.push({ x: nx, y: ny });
+      gScore.set(nKey, tentative);
+      const f = tentative + octile(nx, ny, tx, ty);
+      heapPush(nx, ny, f);
+      inOpen.add(nKey);
     }
   }
 
+  // If goal blocked / unreachable, approach nearest explored cell to goal
   if (!endKey) {
     let best: string | null = null;
     let bestD = Infinity;
     for (const k of came.keys()) {
       const [x, y] = k.split(',').map(Number) as [number, number];
-      const d = Math.abs(x - tx) + Math.abs(y - ty);
+      const d = octile(x, y, tx, ty);
       if (d < bestD) {
         bestD = d;
         best = k;
@@ -165,7 +268,8 @@ export function findPath(
     cur = came.get(cur) ?? null;
   }
   path.reverse();
-  return smoothPath(walkable, path, sx, sy);
+  if (opts?.smooth) return smoothPath(walkable, path, sx, sy);
+  return path;
 }
 
 /** Prefer orthogonal stand tiles. */

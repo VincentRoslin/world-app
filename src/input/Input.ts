@@ -1,7 +1,7 @@
 import type { Renderer } from '../render/Renderer';
 import type { World } from '../world/World';
 import type { Entity } from '../core/types';
-import { commandAt, queueFish, queueHeroAttack, queueShopInteract, selectAt } from '../systems/Commands';
+import { commandAt, queueFish, queueHeroAttack, queueShopInteract } from '../systems/Commands';
 import { CONFIG } from '../config';
 import { placeBlacksmith } from '../systems/Production';
 
@@ -22,6 +22,8 @@ export class Input {
    * WASD / arrows / middle-drag pan unlocks; F re-locks on the hero.
    */
   private cameraFollow = true;
+  /** Dev: ignore camera leash so you can survey the whole loaded map. */
+  private devCameraUnlocked = false;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -130,22 +132,55 @@ export class Input {
     if (base) this.renderer.centerOn(base.x, base.y);
   }
 
+  /** Dev toggle: free roam past camera leash (for map review). */
+  toggleDevCameraUnlock(): boolean {
+    this.devCameraUnlocked = !this.devCameraUnlocked;
+    if (this.devCameraUnlocked) {
+      this.unlockCamera();
+      this.world.message = 'Dev cam ON — leash off, map streams under camera';
+    } else {
+      this.clampCameraToHero();
+      this.world.message = 'Dev cam OFF — leash restored';
+    }
+    return this.devCameraUnlocked;
+  }
+
+  isDevCameraUnlocked(): boolean {
+    return this.devCameraUnlocked;
+  }
+
+  /** Pull free-look camera back if it strays too far from the hero. */
+  private clampCameraToHero(): void {
+    if (this.devCameraUnlocked) return;
+    const hero = this.world.hero();
+    if (hero && hero.alive) {
+      this.renderer.clampNear(hero.x, hero.y, CONFIG.cameraLeashTiles);
+      return;
+    }
+    const base = this.world.base();
+    if (base) this.renderer.clampNear(base.x, base.y, CONFIG.cameraLeashTiles);
+  }
+
   update(dt: number): void {
     // The inventory is an overlay, not a modal game state. Keep camera controls
     // available while comparing equipment or managing bags.
-    const panSpeed = 420 / this.renderer.zoom;
+    const panSpeed = 320 / Math.max(0.4, this.renderer.zoom);
     const panUp = this.keys.has('w') || this.keys.has('arrowup');
     const panDown = this.keys.has('s') || this.keys.has('arrowdown');
     const panLeft = this.keys.has('a') || this.keys.has('arrowleft');
     const panRight = this.keys.has('d') || this.keys.has('arrowright');
     if (panUp || panDown || panLeft || panRight) {
-      // Soft unlock: free look while panning
       this.unlockCamera();
-      if (panUp) this.renderer.cameraY += panSpeed * dt;
-      if (panDown) this.renderer.cameraY -= panSpeed * dt;
-      if (panLeft) this.renderer.cameraX += panSpeed * dt;
-      if (panRight) this.renderer.cameraX -= panSpeed * dt;
+      let dx = 0;
+      let dy = 0;
+      // Screen-space pan (same axes as mouse drag)
+      if (panLeft) dx -= panSpeed * dt;
+      if (panRight) dx += panSpeed * dt;
+      if (panUp) dy -= panSpeed * dt;
+      if (panDown) dy += panSpeed * dt;
+      this.renderer.panScreen(dx, dy);
     }
+    if (!this.cameraFollow) this.clampCameraToHero();
   }
 
   private eventToCanvas(e: MouseEvent): { sx: number; sy: number } {
@@ -159,16 +194,24 @@ export class Input {
   }
 
   /**
-   * Screen-space pick: sprites draw upward from the foot tile, so world unproject
-   * from a body-click lands on the wrong tile. Score each candidate by distance
-   * to its projected foot + vertical body hit-box (species-aware).
+   * 3D-aware pick: ray hits the ground, so prefer **world footprint** over huge
+   * screen boxes (those made the base steal clicks from neighboring tiles).
+   *
+   * Priority:
+   * 1) Buildings / nodes whose footprint contains the ground tile under cursor
+   * 2) Units within a small world-space radius of that ground point
+   * 3) Tight screen fallback for unit bodies only (not large buildings)
    */
   private pickEntityAtScreen(
     sx: number,
     sy: number,
     kinds: Entity['kind'][],
   ): Entity | null {
-    const z = this.renderer.zoom;
+    const z = Math.max(0.5, this.renderer.zoom);
+    const wpos = this.renderer.screenToWorld(sx, sy);
+    const gx = Math.floor(wpos.x);
+    const gy = Math.floor(wpos.y);
+
     let best: Entity | null = null;
     let bestScore = Infinity;
 
@@ -176,64 +219,109 @@ export class Input {
       if (!e.alive) continue;
       if (!kinds.includes(e.kind)) continue;
       if (e.kind === 'enemy' || e.kind === 'resourceNode') {
-        if (!this.world.isExplored(Math.floor(e.x), Math.floor(e.y))) continue;
+        if (!this.world.tileAt(Math.floor(e.x), Math.floor(e.y))) continue;
       }
 
+      // ── Footprint picks (exact tile ownership) ─────────────────────
+      if (e.kind === 'base' || e.kind === 'blacksmith') {
+        // 2×2: center is e.x,e.y → tiles [floor(e.x)-1 .. floor(e.x)] × same for y
+        const ox = Math.floor(e.x) - 1;
+        const oy = Math.floor(e.y) - 1;
+        if (gx >= ox && gx < ox + 2 && gy >= oy && gy < oy + 2) {
+          // Prefer closest to building center among footprint hits
+          const score = (wpos.x - e.x) ** 2 + (wpos.y - e.y) ** 2;
+          if (score < bestScore) {
+            bestScore = score;
+            best = e;
+          }
+        }
+        continue; // never use oversized screen boxes for buildings
+      }
+
+      if (e.kind === 'resourceNode') {
+        if (Math.floor(e.x) === gx && Math.floor(e.y) === gy) {
+          const score = (wpos.x - e.x) ** 2 + (wpos.y - e.y) ** 2;
+          if (score < bestScore) {
+            bestScore = score;
+            best = e;
+          }
+        }
+        continue;
+      }
+
+      if (e.kind === 'loot') {
+        if (Math.floor(e.x) === gx && Math.floor(e.y) === gy) {
+          const score = (wpos.x - e.x) ** 2 + (wpos.y - e.y) ** 2 * 0.5;
+          if (score < bestScore) {
+            bestScore = score;
+            best = e;
+          }
+        }
+        // small world radius too
+        const wd = Math.hypot(wpos.x - e.x, wpos.y - e.y);
+        if (wd < 0.45) {
+          const score = wd * wd;
+          if (score < bestScore) {
+            bestScore = score;
+            best = e;
+          }
+        }
+        continue;
+      }
+
+      // ── Units: tight world radius first ────────────────────────────
+      let worldR = 0.48;
+      if (e.kind === 'enemy' && e.species === 'cow') worldR = 0.55;
+      else if (e.kind === 'worker') worldR = 0.42;
+      else if (e.kind === 'hero' || e.kind === 'npc') worldR = 0.5;
+
+      const wd = Math.hypot(wpos.x - e.x, wpos.y - e.y);
+      if (wd <= worldR) {
+        // Prefer closer units; slight bias so hero is easy to re-select
+        const score = wd * wd * (e.kind === 'hero' ? 0.85 : 1);
+        if (score < bestScore) {
+          bestScore = score;
+          best = e;
+        }
+        continue;
+      }
+
+      // ── Tight screen fallback (body only — still small) ────────────
+      // Helps when the unit stands slightly off the raycast ground point.
       const foot = this.renderer.worldToScreen(e.x, e.y);
-      const footY = foot.y + CONFIG.entityDrawYOffset * z;
-
-      let halfW = 14 * z;
-      let heightUp = 28 * z;
-      let heightDown = 8 * z;
-
+      let halfW = 10 * z;
+      let heightUp = 26 * z;
+      let heightDown = 6 * z;
       if (e.kind === 'enemy') {
         if (e.species === 'cow') {
-          halfW = 16 * z;
-          heightUp = 18 * z;
-          heightDown = 10 * z;
-        } else if (e.species === 'goblin') {
-          halfW = 14 * z;
-          heightUp = 26 * z;
-          heightDown = 10 * z;
-        } else {
           halfW = 12 * z;
-          heightUp = 36 * z;
-          heightDown = 8 * z;
+          heightUp = 16 * z;
+        } else if (e.species === 'goblin') {
+          halfW = 10 * z;
+          heightUp = 22 * z;
+        } else {
+          halfW = 10 * z;
+          heightUp = 28 * z;
         }
-      } else if (e.kind === 'hero') {
-        halfW = 12 * z;
-        heightUp = 36 * z;
-      } else if (e.kind === 'npc') {
-        halfW = 12 * z;
-        heightUp = 36 * z;
-      } else if (e.kind === 'worker') {
-        halfW = 11 * z;
-        heightUp = 28 * z;
-      } else if (e.kind === 'base') {
-        halfW = 40 * z;
-        heightUp = 50 * z;
-        heightDown = 20 * z;
-      } else if (e.kind === 'blacksmith') {
-        halfW = 38 * z;
-        heightUp = 42 * z;
-        heightDown = 18 * z;
-      } else if (e.kind === 'resourceNode') {
-        halfW = 16 * z;
+      } else if (e.kind === 'hero' || e.kind === 'npc') {
+        halfW = 10 * z;
         heightUp = 30 * z;
-      } else if (e.kind === 'loot') {
-        halfW = 12 * z;
-        heightUp = 16 * z;
-        heightDown = 8 * z;
+      } else if (e.kind === 'worker') {
+        halfW = 9 * z;
+        heightUp = 24 * z;
       }
 
+      // Only allow screen fallback if ground click is already near the unit
+      if (wd > 1.05) continue;
+
       const dx = sx - foot.x;
-      const above = footY - sy;
+      const above = foot.y - sy;
       if (Math.abs(dx) > halfW) continue;
       if (above < -heightDown || above > heightUp) continue;
 
-      const bodyCenterY = footY - heightUp * 0.45;
+      const bodyCenterY = foot.y - heightUp * 0.45;
       const dy = sy - bodyCenterY;
-      const score = dx * dx + dy * dy * 0.65;
+      const score = 0.35 + dx * dx * 0.02 + dy * dy * 0.015 + wd * wd;
       if (score < bestScore) {
         bestScore = score;
         best = e;
@@ -257,10 +345,17 @@ export class Input {
     const gy = Math.floor(wpos.y);
 
     if (e.button === 0) {
+      // Building placement always wins on LMB
       if (this.world.buildingPlacement) {
         placeBlacksmith(this.world, gx, gy);
         return;
       }
+      /**
+       * LMB hybrid:
+       * - Entity → select only (workers, base, nodes, enemies, vendor…)
+       * - Empty ground → move (hero, or selected worker)
+       * RMB still does attack / shop / fish / move so nothing is lost.
+       */
       const picked = this.pickEntityAtScreen(sx, sy, [
         'hero',
         'worker',
@@ -279,27 +374,27 @@ export class Input {
           picked.kind === 'blacksmith' ||
           picked.kind === 'npc' ||
           picked.kind === 'enemy' ||
-          picked.kind === 'resourceNode')
+          picked.kind === 'resourceNode' ||
+          picked.kind === 'loot')
       ) {
         this.world.selectedId = picked.id;
-      } else {
-        selectAt(this.world, gx, gy, wpos.x, wpos.y);
+        return;
       }
+      // Empty ground: move selected worker, else hero
+      commandAt(this.world, wpos.x, wpos.y);
     } else if (e.button === 2) {
-      // RMB shop NPC → walk into range then open (like attack/fish)
+      // RMB = context actions (unchanged) + ground move still works
       const npc = this.pickEntityAtScreen(sx, sy, ['npc']);
       if (npc && npc.kind === 'npc' && npc.role === 'shop') {
         this.world.selectedId = npc.id;
         queueShopInteract(this.world, npc.id);
         return;
       }
-      // RMB on mob → queue attack for next game tick
       const enemy = this.pickEntityAtScreen(sx, sy, ['enemy']);
       if (enemy && enemy.kind === 'enemy') {
         queueHeroAttack(this.world, enemy.id);
         return;
       }
-      // RMB fishing spot → queue fish
       const spot = this.pickEntityAtScreen(sx, sy, ['resourceNode']);
       if (
         spot &&
@@ -311,7 +406,7 @@ export class Input {
         queueFish(this.world, spot.id);
         return;
       }
-      // RMB ground → queue walk / flee for next tick
+      // RMB ground → move / flee (same as LMB empty ground)
       commandAt(this.world, wpos.x, wpos.y);
     }
   }
@@ -354,10 +449,10 @@ export class Input {
       this.unlockCamera();
       const dx = e.clientX - this.lastPanX;
       const dy = e.clientY - this.lastPanY;
-      this.renderer.cameraX += dx;
-      this.renderer.cameraY += dy;
+      this.renderer.panScreen(dx, dy);
       this.lastPanX = e.clientX;
       this.lastPanY = e.clientY;
+      this.clampCameraToHero();
     }
   }
 
@@ -369,8 +464,10 @@ export class Input {
     let delta = e.deltaY;
     if (e.deltaMode === 1) delta *= 16;
     if (e.deltaMode === 2) delta *= rect.height;
-    const factor = delta > 0 ? 0.9 : 1.1;
+    // Gentler steps; hard min/max live in Renderer.zoomAt (CONFIG.minZoom/maxZoom)
+    const factor = delta > 0 ? 0.94 : 1.06;
     this.renderer.zoomAt(sx, sy, this.renderer.zoom * factor);
+    this.clampCameraToHero();
     const wpos = this.renderer.screenToWorld(sx, sy);
     this.world.hoverTile = { gx: Math.floor(wpos.x), gy: Math.floor(wpos.y) };
   }
